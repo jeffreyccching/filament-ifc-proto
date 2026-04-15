@@ -1,4 +1,0 @@
-[submodule "examples/shared_tee-label"]
-	path = examples/shared_tee
-	url = https://github.com/qisheng-jiang/shared_tee.git
-	branch = label
