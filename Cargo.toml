@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "fg_ifc_library/macros",
+    "fg_ifc_library/typing_rules",
+    "examples/all_function_calls",
+    "examples/battleship_new",
+    "examples/battleship-no-ifc",
+    "examples/calendar",
+    "examples/calendar-no-ifc",
+    "examples/spotify-tui",
+    "examples/spotify-tui-original",
+    "examples/jpmail",
+    "examples/jpmail-no-ifc", 
+    "examples/dynamic_examples",
+    "examples/toy_examples",
+]
+exclude = [
+    
+    "examples/benchmark_games/*/",
+    "examples/benchmark_games/originals",
+]
+resolver = "2"
