@@ -1,0 +1,10 @@
+[package]
+name = "all_function_calls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macros = { path = "../../fg_ifc_library/macros" }
+typing_rules = { path = "../../fg_ifc_library/typing_rules" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

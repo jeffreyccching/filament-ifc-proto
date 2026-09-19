@@ -1,0 +1,8 @@
+[package]
+name = "jpmail-no-ifc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "jpmail-no-ifc"
+path = "src/main.rs"

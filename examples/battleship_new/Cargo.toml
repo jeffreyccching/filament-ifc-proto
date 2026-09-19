@@ -1,0 +1,15 @@
+[package]
+name = "battleship_new"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macros = { path = "../../fg_ifc_library/macros" }
+typing_rules = { path = "../../fg_ifc_library/typing_rules" }
+session_types = {version = "0.3.1"}
+rand = {version = "0.8.5"}
+regex = {version = "1.7.1"}
+
+[[bin]]
+name = "battleship_new"
+path = "src/main.rs"

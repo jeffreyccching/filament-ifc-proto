@@ -1,0 +1,8 @@
+[package]
+name = "typing_rules"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zeroize = "1.6"
+#serde = { version = "1.0", features = ["derive"] }

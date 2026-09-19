@@ -1,0 +1,12 @@
+[package]
+name = "jpmail"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macros = { path = "../../fg_ifc_library/macros" }
+typing_rules = { path = "../../fg_ifc_library/typing_rules" }
+
+[[bin]]
+name = "jpmail"
+path = "src/main.rs"
