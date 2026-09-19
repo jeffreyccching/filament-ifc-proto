@@ -1,73 +1,98 @@
-# Battleship New - Security-Typed Rust Implementation
+# Battleship — Filament port of Cocoon's case study
 
-## Overview
+A two-player Battleship game where each player's ship positions are secret from the
+opponent. This is Filament's port of the same case study Cocoon uses
+(`ifc_examples/battleship` in the Cocoon repository), kept deliberately close to it so the
+two can be compared.
 
-This project is a new implementation of the classic Battleship game using Rust with **security typing** and **information flow control (IFC)** features from the `typing_rules` and `macros` libraries.
+## The policy
 
-It follows the same game logic as the original `battleship` example but with syntax and patterns strictly adhering to:
-- **Macro library** (`macros::pc_block`) for program counter tracking and implicit flow analysis
-- **Typing rules library** (`typing_rules::*`) for information flow control with security lattices
+Each player's `ship_positions` is labeled with that player's level (`A` for one, `B` for the
+other) and must stay hidden from the opponent. The only thing that may be revealed is whether
+a given guess hit — which is the game.
 
-## Key Features
+```rust
+struct Player<L: Label> {
+    ship_positions: Labeled<Grid<bool>, L>,   // secret
+    guesses: Grid<CellStatus>,                // public: announced to the opponent
+}
+```
 
-### 1. **Security-Typed Data**
-- Uses `Labeled<T, L>` wrapper to attach security labels to data
-- Supports multiple security levels: `Public`, `A`, `B`, and `AB` (join of A and B)
-- Enforces explicit flow control via `FlowsTo` trait
-- Enforces implicit flow control via PC (program counter) tracking
+The grid is 10×10 and the five ships (carrier 5, battleship 4, cruiser 3, submarine 3,
+destroyer 2) occupy 17 cells in total, which is what `did_win` counts.
 
-### 2. **Game Logic**
-- Two players (Alice and Bob) play battleship on 5x5 grids
-- Each player has secret ships placed on their board
-- Players exchange guesses via message channels
-- Game validates hits/misses with information flow control
+## What this example does and does not use
 
-### 3. **Program Counter Blocks**
-- Uses `pc_block!` macro to track implicit information flows
-- Prevents data leakage through control flow (if/else conditions)
-- Enforces that secret conditions don't affect public writes
+| Construct | Count | Why |
+|---|---|---|
+| `Labeled<T, L>` | on `ship_positions` | the secret |
+| `declassify` | 2 | one per game loop, revealing hit/miss — intentional, and the point of the game |
+| `pc_block!` | 0 | no branch or loop condition depends on a labeled value |
+| `#[side_effect_free_attr]` | 0 | no code runs inside a `pc_block!` |
+| `unchecked_operation` | 0 | nothing needs to bypass a check |
 
-## Project Structure
+The two `declassify` calls are the entire trusted surface. See `examples/calendar` for the
+example that does exercise `pc_block!`.
+
+## Why no block is needed during ship placement
+
+Ship placement runs on an **unlabeled** grid and is wrapped once at the end:
+
+```rust
+let mut raw_positions: Grid<bool> = [[false; GRID_SIZE]; GRID_SIZE];
+for ship in &ships {
+    let placement = random_placement(&raw_positions, ship);
+    place_ship(&mut raw_positions, &placement);
+}
+Player { ship_positions: Labeled::<Grid<bool>, L>::new(raw_positions), .. }
+```
+
+Nothing labeled flows *into* this. `Player::new` takes no arguments, and its only inputs are a
+constant array of ship sizes and `util::random`, which is raw `usize` in and out. The grid
+becomes secret by declaration, not by derivation, so there is no flow for the system to check
+until `Labeled::new` stamps the policy on.
+
+Cocoon reaches the same place differently: `wrap_secret` is only callable inside a
+`secret_block!`, so the whole placement loop must sit in one, every helper must carry
+`#[side_effect_free_attr]`, and its `place_ship` needs `unchecked_operation` for the grid write
+(Cocoon Figure 6a). The helper signatures here match Cocoon's — all take raw `&Grid<bool>` —
+because inside a secret block Cocoon's grid is raw too.
+
+This is contingent on placement being secret-independent, which holds here. If placement
+consumed a secret (a labeled seed, say), the rejection-sampling loop in `random_placement`
+would branch on a labeled value and would need a `pc_block!` — and `util::random` mutates RNG
+state, so it would then need an escape hatch, exactly as in Cocoon.
+
+## Structure
 
 ```
 battleship_new/
-├── Cargo.toml          # Project manifest
+├── Cargo.toml
+├── README.md
 └── src/
-    └── main.rs        # Main game implementation
+    ├── main.rs   # game logic, placement, the two game loops
+    └── util.rs   # util::random
 ```
 
-## Building and Running
+The two players run as threads in a single process, communicating over `session_types`
+channels, with the protocol encoded in the `PlayerA` / `PlayerB` session types.
 
-### Build the project:
+## Building and running
+
 ```bash
-cd /winhomes/jcc150/real_static_rust
 cargo build -p battleship_new
+cargo run   -p battleship_new
 ```
 
-### Run the game:
+Both players read guesses from stdin in the format `<row letter> <column>`, e.g. `a 1`
+(rows `a`–`j`, columns 1–10). Play continues until one side has 17 hits.
+
+## Tests
+
 ```bash
-cargo run -p battleship_new
+cargo test -p battleship_new
 ```
 
-## Game Flow
-
-1. Alice and Bob each initialize a player with secret ship placements
-2. Alice starts by guessing coordinates (0,0), then (1,1), then (2,2)
-3. Bob responds with hits/misses, then makes his own guesses
-4. Game runs for 3 rounds
-5. All secret data is properly labeled and flow-controlled
-
-## Type Safety
-
-The implementation demonstrates:
-- **Generic label parameters** `<L: Label>` for secure data containers
-- **PcContext** for tracking program counter security level
-- **Implicit flow tracking** through `pc_block!` macro
-- **Declassification** where secrets are safely downgraded to public information before transmission
-
-## Differences from Original Battleship
-
-Both implementations share identical game logic, but `battleship_new`:
-- Relies more heavily on the `pc_block!` macro for control flow security
-- Uses simplified trait bounds that leverage `Public: FlowsTo<L>` constraint
-- Demonstrates how information flow control integrates with game state mutations
+`ships_do_not_overlap` builds 200 players and asserts each grid has exactly 17 occupied cells.
+This is a regression guard: `legal_placement` previously ignored its `grid` argument, so ships
+could overlap and a game could be unwinnable.

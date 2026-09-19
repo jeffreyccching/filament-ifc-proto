@@ -73,7 +73,7 @@ pub fn handler(key: Key, app: &mut App) {
         };
       }
     },
-    
+    //recommended playlist based on selected track
     Key::Char('r') => {
       handle_recommended_tracks(app);
     }

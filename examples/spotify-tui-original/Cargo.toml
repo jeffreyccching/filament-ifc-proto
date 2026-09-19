@@ -33,3 +33,13 @@ anyhow = "1.0.43"
 bench = false
 path = "src/main.rs"
 name = "spt"
+
+# Built outside the root workspace (it is in the root manifest's `exclude`), so
+# it is its own workspace root and needs its own copy of the chrono patch:
+# chrono 0.4.37 (pulled in transitively by rspotify 0.10.0) derives
+# RustcEncodable/RustcDecodable, compiler builtins that rustc no longer
+# provides. `[patch]` is only honoured at a workspace root, so it must live here.
+[workspace]
+
+[patch.crates-io]
+chrono = { path = "../../vendored-chrono" }

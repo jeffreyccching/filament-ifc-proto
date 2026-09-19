@@ -56,6 +56,7 @@ mod tests {
     handler(Key::Up, &mut app);
     assert_eq!(app.home_scroll, 0);
 
+    // Check that smashing the up button doesn't go to negative scroll (which would cause a crash)
     handler(Key::Up, &mut app);
     handler(Key::Up, &mut app);
     handler(Key::Up, &mut app);
@@ -86,6 +87,7 @@ mod tests {
     handler(Key::Ctrl('u'), &mut app);
     assert_eq!(app.home_scroll, scroll - LARGE_SCROLL * 2);
 
+    // Check that smashing the up button doesn't go to negative scroll (which would cause a crash)
     handler(Key::Ctrl('u'), &mut app);
     handler(Key::Ctrl('u'), &mut app);
     handler(Key::Ctrl('u'), &mut app);

@@ -83,6 +83,8 @@ where
     .margin(2)
     .split(f.size());
 
+  // Create a one-column table to avoid flickering due to non-determinism when
+  // resolving constraints on widths of table columns.
   let format_row =
     |r: Vec<String>| -> Vec<String> { vec![format!("{:50}{:40}{:20}", r[0], r[1], r[2])] };
 
@@ -122,7 +124,7 @@ pub fn draw_input_and_help_box<B>(f: &mut Frame<B>, app: &App, layout_chunk: Rec
 where
   B: Backend,
 {
-  
+  // Check for the width and change the contraints accordingly
   let chunks = Layout::default()
     .direction(Direction::Horizontal)
     .constraints(
@@ -179,7 +181,7 @@ where
   B: Backend,
 {
   let margin = util::get_main_layout_margin(app);
-  
+  // Responsive layout: new one kicks in at width 150 or higher
   if app.size.width >= SMALL_TERMINAL_WIDTH && !app.user_config.behavior.enforce_wide_search_bar {
     let parent_layout = Layout::default()
       .direction(Direction::Vertical)
@@ -187,8 +189,10 @@ where
       .margin(margin)
       .split(f.size());
 
+    // Nested main block with potential routes
     draw_routes(f, app, parent_layout[0]);
 
+    // Currently playing
     draw_playbar(f, app, parent_layout[1]);
   } else {
     let parent_layout = Layout::default()
@@ -204,13 +208,17 @@ where
       .margin(margin)
       .split(f.size());
 
+    // Search input and help
     draw_input_and_help_box(f, app, parent_layout[0]);
 
+    // Nested main block with potential routes
     draw_routes(f, app, parent_layout[1]);
 
+    // Currently playing
     draw_playbar(f, app, parent_layout[2]);
   }
 
+  // Possibly draw confirm dialog
   draw_dialog(f, app);
 }
 
@@ -264,11 +272,11 @@ where
     RouteId::Recommendations => {
       draw_recommendations_table(f, app, chunks[1]);
     }
-    RouteId::Error => {} 
-    RouteId::SelectedDevice => {} 
-    RouteId::Analysis => {} 
-    RouteId::BasicView => {} 
-    RouteId::Dialog => {} 
+    RouteId::Error => {} // This is handled as a "full screen" route in main.rs
+    RouteId::SelectedDevice => {} // This is handled as a "full screen" route in main.rs
+    RouteId::Analysis => {} // This is handled as a "full screen" route in main.rs
+    RouteId::BasicView => {} // This is handled as a "full screen" route in main.rs
+    RouteId::Dialog => {} // This is handled in the draw_dialog function in mod.rs
   };
 }
 
@@ -323,7 +331,7 @@ pub fn draw_user_block<B>(f: &mut Frame<B>, app: &App, layout_chunk: Rect)
 where
   B: Backend,
 {
-  
+  // Check for width to make a responsive layout
   if app.size.width >= SMALL_TERMINAL_WIDTH && !app.user_config.behavior.enforce_wide_search_bar {
     let chunks = Layout::default()
       .direction(Direction::Vertical)
@@ -337,6 +345,7 @@ where
       )
       .split(layout_chunk);
 
+    // Search input and help
     draw_input_and_help_box(f, app, chunks[0]);
     draw_library_block(f, app, chunks[1]);
     draw_playlist_block(f, app, chunks[2]);
@@ -346,6 +355,7 @@ where
       .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
       .split(layout_chunk);
 
+    // Search input and help
     draw_library_block(f, app, chunks[0]);
     draw_playlist_block(f, app, chunks[1]);
   }
@@ -798,7 +808,7 @@ where
       ],
     })
     .collect::<Vec<TableItem>>();
-  
+  // match RecommendedContext
   let recommendations_ui = match &app.recommendations_context {
     Some(RecommendationsContext::Song) => format!(
       "Recommendations based on Song \'{}\'",
@@ -893,7 +903,7 @@ pub fn draw_basic_view<B>(f: &mut Frame<B>, app: &App)
 where
   B: Backend,
 {
-  
+  // If space is negative, do nothing because the widget would not fit
   if let Some(s) = app.size.height.checked_sub(BASIC_VIEW_HEIGHT) {
     let space = s / 2;
     let chunks = Layout::default()
@@ -929,6 +939,8 @@ where
     .margin(1)
     .split(layout_chunk);
 
+  // If no track is playing, render paragraph showing which device is selected, if no selected
+  // give hint to choose a device
   if let Some(current_playback_context) = &app.current_playback_context {
     if let Some(track_item) = &current_playback_context.item {
       let play_title = if current_playback_context.is_playing {
@@ -1133,12 +1145,15 @@ where
 
   let changelog = include_str!("../../CHANGELOG.md").to_string();
 
+  // If debug mode show the "Unreleased" header. Otherwise it is a release so there should be no
+  // unreleased features
   let clean_changelog = if cfg!(debug_assertions) {
     changelog
   } else {
     changelog.replace("\n## [Unreleased]\n", "")
   };
 
+  // Banner text with correct styling
   let mut top_text = Text::from(BANNER);
   top_text.patch_style(Style::default().fg(app.user_config.theme.banner));
 
@@ -1149,11 +1164,13 @@ where
   );
   let bottom_text = Text::from(bottom_text_raw.as_str());
 
+  // Contains the banner
   let top_text = Paragraph::new(top_text)
     .style(Style::default().fg(app.user_config.theme.text))
     .block(Block::default());
   f.render_widget(top_text, chunks[0]);
 
+  // CHANGELOG
   let bottom_text = Paragraph::new(bottom_text)
     .style(Style::default().fg(app.user_config.theme.text))
     .block(Block::default())
@@ -1406,7 +1423,7 @@ where
     id: TableId::PodcastEpisodes,
     items: vec![
       TableHeaderItem {
-        
+        // Column to mark an episode as fully played
         text: "",
         width: 2,
         ..Default::default()
@@ -1565,7 +1582,7 @@ where
       TableHeaderItem {
         id: ColumnId::Title,
         text: "Title",
-        
+        // We need to subtract the fixed value of the previous column
         width: get_percentage_width(layout_chunk.width, 2.0 / 5.0) - 2,
       },
       TableHeaderItem {
@@ -1637,6 +1654,7 @@ fn draw_selectable_list<B, S>(
     .map(|i| ListItem::new(Span::raw(i.as_ref())))
     .collect();
 
+  //TODO
   let list = List::new(lst_items)
     .block(
       Block::default()
@@ -1661,7 +1679,7 @@ where
   if let ActiveBlock::Dialog(_) = app.get_current_route().active_block {
     if let Some(playlist) = app.dialog.as_ref() {
       let bounds = f.size();
-      
+      // maybe do this better
       let width = std::cmp::min(bounds.width - 2, 45);
       let height = 8;
       let left = (bounds.width - width) / 2;
@@ -1683,6 +1701,8 @@ where
         .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
         .split(rect);
 
+      // suggestion: possibly put this as part of
+      // app.dialog, but would have to introduce lifetime
       let text = vec![
         Spans::from(Span::raw("Are you sure you want to delete the playlist: ")),
         Spans::from(Span::styled(
@@ -1733,8 +1753,8 @@ fn draw_table<B>(
   f: &mut Frame<B>,
   app: &App,
   layout_chunk: Rect,
-  table_layout: (&str, &TableHeader), 
-  items: &[TableItem], 
+  table_layout: (&str, &TableHeader), // (title, header colums)
+  items: &[TableItem], // The nested vector must have the same length as the `header_columns`
   selected_index: usize,
   highlight_state: (bool, bool),
 ) where
@@ -1754,6 +1774,8 @@ fn draw_table<B>(
 
   let (title, header) = table_layout;
 
+  // Make sure that the selected item is visible on the page. Need to add some rows of padding
+  // to chunk height for header and header space to get a true table height
   let padding = 5;
   let offset = layout_chunk
     .height
@@ -1763,11 +1785,12 @@ fn draw_table<B>(
 
   let rows = items.iter().skip(offset).enumerate().map(|(i, item)| {
     let mut formatted_row = item.format.clone();
-    let mut style = Style::default().fg(app.user_config.theme.text); 
+    let mut style = Style::default().fg(app.user_config.theme.text); // default styling
 
+    // if table displays songs
     match header.id {
       TableId::Song | TableId::RecentlyPlayed | TableId::Album => {
-        
+        // First check if the song should be highlighted because it is currently playing
         if let Some(title_idx) = header.get_index(ColumnId::Title) {
           if let Some(track_playing_offset_index) =
             track_playing_index.and_then(|idx| idx.checked_sub(offset))
@@ -1781,6 +1804,7 @@ fn draw_table<B>(
           }
         }
 
+        // Show this the liked icon if the song is liked
         if let Some(liked_idx) = header.get_index(ColumnId::Liked) {
           if app.liked_song_ids_set.contains(item.id.as_str()) {
             formatted_row[liked_idx] = app.user_config.padded_liked_icon();
@@ -1804,10 +1828,12 @@ fn draw_table<B>(
       _ => {}
     }
 
+    // Next check if the item is under selection.
     if Some(i) == selected_index.checked_sub(offset) {
       style = selected_style;
     }
 
+    // Return row styled data
     Row::new(formatted_row).style(style)
   });
 

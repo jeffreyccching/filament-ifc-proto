@@ -30,7 +30,7 @@ use rspotify::model::{context::CurrentlyPlaybackContext, PlayingItem};
 pub use input::handler as input_handler;
 
 pub fn handle_app(key: Key, app: &mut App) {
-  
+  // First handle any global event and then move to block event
   match key {
     Key::Esc => {
       handle_escape(app);
@@ -53,7 +53,7 @@ pub fn handle_app(key: Key, app: &mut App) {
     _ if key == app.user_config.keys.increase_volume => {
       app.increase_volume();
     }
-    
+    // Press space to toggle playback
     _ if key == app.user_config.keys.toggle_playback => {
       app.toggle_playback();
     }
@@ -98,6 +98,7 @@ pub fn handle_app(key: Key, app: &mut App) {
   }
 }
 
+// Handle event for the current active block
 fn handle_block_events(key: Key, app: &mut App) {
   let current_route = app.get_current_route();
   match current_route.active_block {
@@ -186,7 +187,7 @@ fn handle_escape(app: &mut App) {
     ActiveBlock::Dialog(_) => {
       app.pop_navigation_stack();
     }
-    
+    // These are global views that have no active/inactive distinction so do nothing
     ActiveBlock::SelectDevice | ActiveBlock::Analysis => {}
     _ => {
       app.set_current_route_state(Some(ActiveBlock::Empty), None);
@@ -225,6 +226,7 @@ fn handle_jump_to_album(app: &mut App) {
   }
 }
 
+// NOTE: this only finds the first artist of the song and jumps to their albums
 fn handle_jump_to_artist_album(app: &mut App) {
   if let Some(CurrentlyPlaybackContext {
     item: Some(item), ..
@@ -240,7 +242,7 @@ fn handle_jump_to_artist_album(app: &mut App) {
         }
       }
       PlayingItem::Episode(_episode) => {
-        
+        // Do nothing for episode (yet!)
       }
     }
   };

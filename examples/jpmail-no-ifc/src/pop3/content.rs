@@ -1,12 +1,43 @@
+// ============================================================================
+// Mirrors: jpmail/src/pop3/ContentType.jif
+//          jpmail/src/pop3/ContentDisposition.jif
+//
+// These classes parse MIME header parameters. Content-Type and
+// Content-Disposition are *public* metadata -- the mail system (and indeed
+// any SMTP relay) can see these values.
+//
+// ContentType.jif (abridged):
+//   class ContentType {
+//       protected String{} contentType;    // e.g. "text"
+//       protected String{} subtype;        // e.g. "plain"
+//       protected String{} boundary;       // multipart boundary
+//       protected String{} name;
+//       protected String{} charset;
+//       protected String{} format;
+//       static ContentType getContentType(BufferedReader br)
+//   }
+//
+// ContentDisposition.jif (abridged):
+//   class ContentDisposition {
+//       protected String{} disposition;    // "inline" or "attachment"
+//       protected String{} filename;
+//       static ContentDisposition getContentDisposition(BufferedReader br)
+//       boolean isAttachment()
+//   }
+// ============================================================================
 
+/// MIME Content-Type parsed from an email header.
+///
+/// Mirrors: ContentType.jif
+/// All fields are public (String{} in Jif -- raw, no label needed).
 #[derive(Debug, Clone)]
 pub struct ContentType {
-    pub content_type: String,       
-    pub subtype: String,            
-    pub boundary: Option<String>,   
-    pub name: Option<String>,       
-    pub charset: Option<String>,    
-    pub format: Option<String>,     
+    pub content_type: String,       // String{} e.g. "text", "multipart"
+    pub subtype: String,            // String{} e.g. "plain", "mixed"
+    pub boundary: Option<String>,   // String{} present in multipart/*
+    pub name: Option<String>,       // String{} attachment filename hint
+    pub charset: Option<String>,    // String{} e.g. "utf-8"
+    pub format: Option<String>,     // String{} e.g. "flowed"
 }
 
 impl ContentType {
@@ -32,6 +63,8 @@ impl ContentType {
         }
     }
 
+    /// Parse a Content-Type header value.
+    /// Mirrors: static getContentType(BufferedReader br) in ContentType.jif
     pub fn parse(header: &str) -> Option<Self> {
         let parts: Vec<&str> = header.splitn(2, '/').collect();
         if parts.len() < 2 {
@@ -69,10 +102,12 @@ impl ContentType {
         Some(ct)
     }
 
+    /// True if this is a multipart/* content type.
     pub fn is_multipart(&self) -> bool {
         self.content_type.to_lowercase() == "multipart"
     }
 
+    /// Format as a header value string.
     pub fn to_header(&self) -> String {
         let mut s = format!("{}/{}", self.content_type, self.subtype);
         if let Some(b) = self.boundary.as_ref() {
@@ -85,10 +120,16 @@ impl ContentType {
     }
 }
 
+// ============================================================================
+
+/// MIME Content-Disposition parsed from an email header.
+///
+/// Mirrors: ContentDisposition.jif
+/// All fields are public (String{} in Jif -- raw, no label needed).
 #[derive(Debug, Clone)]
 pub struct ContentDisposition {
-    pub disposition: String,        
-    pub filename: Option<String>,   
+    pub disposition: String,        // String{} "inline" or "attachment"
+    pub filename: Option<String>,   // String{} attachment filename
 }
 
 impl ContentDisposition {
@@ -106,6 +147,8 @@ impl ContentDisposition {
         }
     }
 
+    /// Parse a Content-Disposition header value.
+    /// Mirrors: static getContentDisposition(BufferedReader br) in ContentDisposition.jif
     pub fn parse(header: &str) -> Option<Self> {
         let parts: Vec<&str> = header.splitn(2, ';').collect();
         if parts.is_empty() {
@@ -125,6 +168,8 @@ impl ContentDisposition {
         Some(cd)
     }
 
+    /// True if this is an attachment (not inline).
+    /// Mirrors: isAttachment() in ContentDisposition.jif
     pub fn is_attachment(&self) -> bool {
         self.disposition.to_lowercase() == "attachment"
     }

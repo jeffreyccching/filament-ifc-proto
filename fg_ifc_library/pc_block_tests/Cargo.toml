@@ -1,0 +1,13 @@
+[package]
+name = "pc_block_tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Tests for pc_block! and #[side_effect_free_attr]: programs they must reject (trybuild) and accept."
+
+[dependencies]
+macros = { path = "../macros" }
+typing_rules = { path = "../typing_rules" }
+
+[dev-dependencies]
+trybuild = "1"

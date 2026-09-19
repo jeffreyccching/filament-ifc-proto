@@ -1,18 +1,35 @@
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
+use crate::stack_scrub::{scrub_stack_best_effort, ScrubPolicy};
+
 // LABEL TRAITS
 // The core security labels used to tag data and execution contexts.
-pub trait Label: Clone + Default + 'static {
+//
+// `ScrubPolicy` is a supertrait so every label dispatches a (possibly no-op)
+// stack scrub at chain/mcall helper exits. Only `T` actually scrubs.
+// The supertraits `Join<Public, Out = Self>` and `Join<Self, Out = Self>` encode two
+// lattice laws: joining with Public (the bottom element) is the identity, and joining a
+// label with itself is idempotent. Stating them here lets the type checker resolve
+// `<L as Join<Public>>::Out = L` and `<L as Join<L>>::Out = L` for any generic `L: Label`,
+// so `pc_block!((L) { if .. })` and joins in generic signatures need no hand-written
+// `where L: Join<..>` bounds. (`Join` deliberately has no `Label` supertrait, or this
+// would be a cycle.)
+pub trait Label:
+    ScrubPolicy
+    + Clone
+    + Default
+    + 'static
+    + Join<Public, Out = Self>
+    + Join<Self, Out = Self>
+    + crate::implicit::PcVisibleSideEffectFree
+    + crate::implicit::InvisibleSideEffectFree
+{
     const PROTECTED: bool = false;
 }
 
 // LABEL COMPONENT TRAIT
-// A label component is anything that can appear in a label position (F1/F2).
-// This includes both static lattice labels (Public, A, B, AB) and nested
-// dynamic release labels (DRLabel<(), S, F1, F2>). This trait enables
-// multi-level nesting like S1?((S2?Secret→Medium)→Public).
-//
+// A label component is anything that can appear in a label position.
 // Every Label is automatically a LabelComponent via the blanket impl below.
 pub trait LabelComponent: Clone + 'static {}
 
@@ -38,6 +55,19 @@ pub struct ABC;
 #[derive(Clone, Default)]
 pub struct T; // Top
 
+// Labels are zero-sized phantom markers with derived Clone/Default and no Drop,
+// so observing one can never produce a side effect. Required by the `Label`
+// supertrait bound, and lets `&SomeLabel` be captured by a pc_block! closure.
+unsafe impl crate::implicit::InvisibleSideEffectFree for Public {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for A {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for B {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for C {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for AB {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for BC {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for AC {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for ABC {}
+unsafe impl crate::implicit::InvisibleSideEffectFree for T {}
+
 impl Label for Public {}
 impl Label for A {}
 impl Label for B {}
@@ -50,10 +80,52 @@ impl Label for T {
     const PROTECTED: bool = true;
 }
 
+// ScrubPolicy: only T (raised-to-T / erasure target) calls the real scrub.
+// Every other label is a no-op `#[inline(always)]` body so the compiler
+// emits zero extra instructions at non-T call sites.
+impl ScrubPolicy for Public {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for A {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for B {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for C {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for AB {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for AC {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for BC {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for ABC {
+    #[inline(always)]
+    fn scrub() {}
+}
+impl ScrubPolicy for T {
+    #[inline(always)]
+    fn scrub() {
+        scrub_stack_best_effort();
+    }
+}
+
 // JOIN OPERATION
 // This trait calculates the Least Upper Bound (LUB) of two labels.
 // It answers: "If I combine data from L1 and L2, what is the new security level?"
-pub trait Join<Other: Label>: Label {
+pub trait Join<Other: Label> {
     type Out: Label;
 }
 
@@ -321,10 +393,10 @@ impl LEQ<T> for BC {}
 
 // ABC flows only to T
 impl LEQ<T> for ABC {}
-                      // RELABEL HELPER
-                      // Used by relabel! macro to enforce LEQ when upgrading labels.
-                      // Raw values are first wrapped as Labeled<T, Public> by the macro,
-                      // then this function checks OldLabel: LEQ<NewLabel>.
+// RELABEL HELPER
+// Used by relabel! macro to enforce LEQ when upgrading labels.
+// Raw values are first wrapped as Labeled<T, Public> by the macro,
+// then this function checks OldLabel: LEQ<NewLabel>.
 #[doc(hidden)]
 #[inline(always)]
 pub fn __relabel_checked<T, OldL: Label + LEQ<NewL>, NewL: Label>(mut v: Labeled<T, OldL>) -> Labeled<T, NewL> {

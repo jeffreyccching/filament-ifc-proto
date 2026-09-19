@@ -34,11 +34,12 @@ enum Ship {
 struct Player {
     ship_positions: Grid<bool>,
 
+    // A player's guesses are public information.
     guesses: Grid<CellStatus>,
 }
 
 struct Placement {
-    
+    // 0: vertical, 1: horizontal.
     orientation: usize,
     start_row: usize,
     start_col: usize,
@@ -49,14 +50,14 @@ type PlayerA = Rec<
     Send<
         (usize, usize),
         Offer<
-            
+            // Case 1: The game is not finished yet.
             Recv<
-                
+                // Did the guess hit a ship?
                 bool,
-                
+                // Receive Player B's guess.
                 Recv<(usize, usize), Choose<Send<bool, Var<Z>>, Eps>>,
             >,
-            
+            // Case 2: PlayerB conceeds.
             Eps,
         >,
     >,
@@ -65,17 +66,17 @@ type PlayerB = Rec<
     Recv<
         (usize, usize),
         Choose<
-            
+            // Case 1: Player A did not win yet.
             Send<
-                
+                // Did the guess hit a ship?
                 bool,
                 Send<
-                    
+                    // Send Player B's guess.
                     (usize, usize),
                     Offer<Recv<bool, Var<Z>>, Eps>,
                 >,
             >,
-            
+            // Case 2: Player A won.
             Eps,
         >,
     >,
@@ -114,6 +115,7 @@ fn print_grid(grid: &Grid<CellStatus>) {
     }
 }
 
+// Guesses are in the format "[a-j] 1-10"
 fn read_guess(input: &mut dyn std::io::BufRead) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let mut line = String::new();
     input.read_line(&mut line)?;
@@ -265,7 +267,7 @@ fn game_loop_a(mut player: Player, chan: session_types::Chan<(), PlayerA>) {
                 c2
             }
             Right(r) => {
-                
+                // We won on that guess.
                 r.close();
                 return;
             }
@@ -337,7 +339,7 @@ fn game_loop_b(mut player: Player, chan: session_types::Chan<(), PlayerB>) {
                 c = c2.zero();
             }
             Right(r) => {
-                
+                // That was a winning guess.
                 r.close();
                 return;
             }

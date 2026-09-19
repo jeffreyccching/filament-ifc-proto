@@ -156,7 +156,7 @@ fn handle_low_press_on_selected_block(app: &mut App) {
 }
 
 fn handle_recommend_event_on_selected_block(app: &mut App) {
-  
+  //recommendations.
   if let Some(artist) = &mut app.artist.clone() {
     match artist.artist_selected_block {
       ArtistBlock::TopTracks => {

@@ -130,7 +130,7 @@ fn check_reserved_keys(key: Key) -> Result<()> {
   ];
   for item in reserved.iter() {
     if key == *item {
-      
+      // TODO: Add pretty print for key
       return Err(anyhow!(
         "The key {:?} is reserved and cannot be remapped",
         key
@@ -474,7 +474,7 @@ impl UserConfig {
     };
     if paths.config_file_path.exists() {
       let config_string = fs::read_to_string(&paths.config_file_path)?;
-      
+      // serde fails if file is empty
       if config_string.trim().is_empty() {
         return Ok(());
       }

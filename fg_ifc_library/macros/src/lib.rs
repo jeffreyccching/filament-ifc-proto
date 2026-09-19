@@ -1,7 +1,6 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote, ToTokens};
-use std::collections::HashSet;
+use quote::{format_ident, quote};
 use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, Expr, Token, Type,
@@ -13,48 +12,20 @@ use syn::{
 
 /// Custom parser for the relabel! syntax:
 ///   relabel!(expr, Label)              → static Labeled (2 args)
-///   relabel!(expr, &events, Lt)        → nested DRLabel inner peel (3 args, runtime check)
-///   relabel!(expr, &events, Lt, Lx)    → flat DRLabel outer resolve (4 args, runtime)
-enum RelabelInput {
-    Static { var: Expr, label: Type },
-    Nested { var: Expr, events: Expr, lt: Type }, // for nested label
-    Dynamic { var: Expr, events: Expr, lt: Type, lx: Type },
+struct RelabelInput {
+    var: Expr,
+    label: Type,
 }
 
 impl Parse for RelabelInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let var: Expr = input.parse()?;
-        let _comma1: Token![,] = input.parse()?;
-
-        // Try parsing second arg as Expr. If a comma follows, we have 3 or 4 args.
-        // If no comma follows, it's the 2-arg static form.
-        let fork = input.fork();
-        if fork.parse::<Expr>().is_ok() && fork.peek(Token![,]) {
-            // 3 or 4 args. Parse the second arg as Expr (the events slice).
-            let second: Expr = input.parse()?;
-            let _comma2: Token![,] = input.parse()?;
-
-            // Peek: if another comma follows after parsing next item → 4-arg dynamic.
-            // Otherwise → 3-arg nested peel.
-            // Use Type (not Expr) for the fork: generic types like HashMap<K,V>
-            // don't parse as Expr and would misfire into the Nested branch.
-            let fork2 = input.fork();
-            if fork2.parse::<Type>().is_ok() && fork2.peek(Token![,]) {
-                // 4-arg dynamic: (var, events, Lt, Lx)
-                let lt: Type = input.parse()?;
-                let _comma3: Token![,] = input.parse()?;
-                let lx: Type = input.parse()?;
-                Ok(RelabelInput::Dynamic { var, events: second, lt, lx })
-            } else {
-                // 3-arg nested: (var, events, Lt)
-                let lt: Type = input.parse()?;
-                Ok(RelabelInput::Nested { var, events: second, lt })
-            }
-        } else {
-            // 2-arg static: (var, Label)
-            let label: Type = input.parse()?;
-            Ok(RelabelInput::Static { var, label })
+        let _comma: Token![,] = input.parse()?;
+        let label: Type = input.parse()?;
+        if !input.is_empty() {
+            return Err(input.error("relabel! takes exactly two arguments: `relabel!(expr, Label)`"));
         }
+        Ok(RelabelInput { var, label })
     }
 }
 
@@ -119,6 +90,26 @@ pub fn fcall(input: TokenStream) -> TokenStream {
                 }
             });
         }
+    }
+
+    // Special case: fcall!(x as Type) — labeled-aware `as` cast.
+    // Chains through `x` so labeled values keep their label; the inner closure
+    // performs the cast and re-wraps as Labeled<_, Public>, which the chain
+    // combinator lifts back to the appropriate label form.
+    if let syn::Expr::Cast(ref cast) = expr_to_check {
+        let val = &cast.expr;
+        let ty = &cast.ty;
+        let expanded = quote! {
+            (#val).__chain(|__v0| {
+                ::typing_rules::lattice::Labeled::<_, ::typing_rules::lattice::Public>::new(__v0 as #ty)
+            })
+        };
+        return TokenStream::from(quote! {
+            {
+                use ::typing_rules::function_rewrite::SecureChain;
+                #expanded
+            }
+        });
     }
 
     let call = match expr_to_check {
@@ -240,8 +231,6 @@ pub fn fcall(input: TokenStream) -> TokenStream {
     }
 
     // 6. Handle the '?' operator if present
-    // If the user wrote fcall!(foo()?), we unwrap the Labeled Result,
-    // propagate the error, and re-wrap the success value.
     if has_question_mark {
         expanded = quote! {
             (#expanded).transpose()?
@@ -428,7 +417,7 @@ pub fn mcall(input: TokenStream) -> TokenStream {
                 quote! {
                     {
                         #helper
-                        (#base).__mcall(|inner| #closure_body).transpose()?
+                        (&mut #base).__mcall_mut(|inner| #closure_body).transpose()?
                     }
                 }
             } else {
@@ -440,36 +429,103 @@ pub fn mcall(input: TokenStream) -> TokenStream {
         // Recursively peels the chain to find the root labeled receiver,
         // then rebuilds the full chain as the closure body.
         // e.g. mcall!(key.chars().all(f)) → __mcall_preserve_label(&key, |inner| inner.chars().all(f))
+        // Also handles `Expr::Index` at the leaf (e.g. mcall!(input[..4].to_vec())):
+        // the index is folded into the closure body as `inner[idx]`.
         Expr::MethodCall(mc) => {
-            fn peel(
-                expr: &Expr,
+            #[allow(clippy::type_complexity)]
+            fn peel<'a>(
+                expr: &'a Expr,
             ) -> (
-                &Expr,
-                Vec<(&syn::Ident, Option<&syn::AngleBracketedGenericArguments>, &syn::punctuated::Punctuated<Expr, syn::token::Comma>)>,
+                &'a Expr,
+                Option<&'a Expr>,
+                Vec<(&'a syn::Ident, Option<&'a syn::AngleBracketedGenericArguments>, &'a syn::punctuated::Punctuated<Expr, syn::token::Comma>)>,
             ) {
                 if let Expr::MethodCall(mc) = expr {
-                    let (base, mut chain) = peel(&mc.receiver);
+                    let (base, leaf_idx, mut chain) = peel(&mc.receiver);
                     chain.push((&mc.method, mc.turbofish.as_ref(), &mc.args));
-                    (base, chain)
+                    (base, leaf_idx, chain)
+                } else if let Expr::Index(ix) = expr {
+                    // Indexed receiver — the labeled root is `ix.expr` and
+                    // `ix.index` becomes the first operation inside the closure.
+                    (&ix.expr, Some(&ix.index), vec![])
                 } else {
-                    (expr, vec![])
+                    (expr, None, vec![])
                 }
             }
             let mc_expr = Expr::MethodCall(mc);
-            let (base, chain) = peel(&mc_expr);
-            let closure_body = chain.iter().fold(quote! { inner }, |acc, (method, turbofish, args)| {
+            let (base, leaf_idx, chain) = peel(&mc_expr);
+
+            // Collect `&ident`-style arguments across all methods in the chain
+            // and prepare per-arg `__chain_ref` wrappers. This lets user code
+            // write `mcall!(buf.extend_from_slice(&block))` where `block` is a
+            // labeled `Labeled<Vec<u8>, L>` and have the macro peel it to
+            // `&Vec<u8>` automatically (auto-deref to `&[u8]` for the call).
+            // Raw (`T: Public`) values pass through the `SecureChainRef`
+            // blanket impl as a no-op chain — so this works for both labeled
+            // and plain references uniformly.
+            //
+            // For each `&ident` arg we generate a fresh `__ma<N>` capture and
+            // rewrite the chain's arg list to use the capture name; later we
+            // wrap the whole `(&mut base).__mcall_mut(…)` in matching
+            // `(ident).__chain_ref(|__ma<N>| …)` calls.
+            let mut ref_captures: Vec<(TokenStream2 /* target ident, sans & */, syn::Ident /* fresh cap */)> = Vec::new();
+            let chain_rewritten: Vec<(syn::Ident, Option<syn::AngleBracketedGenericArguments>, Vec<TokenStream2>)> =
+                chain.iter().map(|(method, turbofish, args)| {
+                    let new_args: Vec<TokenStream2> = args.iter().map(|arg| {
+                        if let Expr::Reference(r) = arg {
+                            if r.mutability.is_none() {
+                                if let Expr::Path(p) = &*r.expr {
+                                    if p.qself.is_none() && p.path.segments.len() == 1
+                                        && p.path.segments[0].arguments.is_empty()
+                                    {
+                                        let target = quote! { #p };
+                                        let cap_name = format_ident!("__ma{}", ref_captures.len());
+                                        ref_captures.push((target, cap_name.clone()));
+                                        return quote! { #cap_name };
+                                    }
+                                }
+                            }
+                        }
+                        quote! { #arg }
+                    }).collect();
+                    ((*method).clone(), turbofish.cloned(), new_args)
+                }).collect();
+
+            // Start the closure body with `inner` or `inner[leaf_idx]` depending
+            // on whether the chain root was an index expression.
+            let start = if let Some(idx) = leaf_idx {
+                quote! { inner[#idx] }
+            } else {
+                quote! { inner }
+            };
+            let closure_body = chain_rewritten.iter().fold(start, |acc, (method, turbofish, new_args)| {
                 if let Some(tf) = turbofish {
-                    quote! {#acc.#method::<#tf>(#args) }
+                    quote! { #acc.#method::<#tf>(#(#new_args),*) }
                 } else {
-                    quote! {#acc.#method(#args) }
+                    quote! { #acc.#method(#(#new_args),*) }
                 }
             });
-            quote! {
+
+            let mut wrapped = quote! {
                 {
                     #helper
-                    (#base).__mcall(|inner| #closure_body)
+                    (&mut #base).__mcall_mut(|inner| #closure_body)
                 }
+            };
+
+            // Wrap with one `__chain_ref` per `&ident` arg, innermost call first.
+            for (target, cap_name) in ref_captures.iter().rev() {
+                wrapped = quote! {
+                    {
+                        use ::typing_rules::function_rewrite::SecureChainRef;
+                        (#target).__chain_ref(|#cap_name| {
+                            #wrapped
+                        })
+                    }
+                };
             }
+
+            wrapped
         }
 
         // --- field access: mcall!(obj.field) or mcall!(obj.0) ---
@@ -479,13 +535,28 @@ pub fn mcall(input: TokenStream) -> TokenStream {
             quote! {
                 {
                     #helper
-                    (#base).__mcall(|inner| inner.#member)
+                    (&mut #base).__mcall_mut(|inner| inner.#member)
+                }
+            }
+        }
+
+        // --- bare index expression: mcall!(obj[idx]) ---
+        // Returns the indexed value cloned (since the closure must produce a
+        // sized owned value). For chained `mcall!(obj[idx].method())` see the
+        // `Expr::MethodCall` arm above which folds index into the chain.
+        Expr::Index(idx) => {
+            let base = &idx.expr;
+            let index = &idx.index;
+            quote! {
+                {
+                    #helper
+                    (&mut #base).__mcall_mut(|inner| inner[#index].clone())
                 }
             }
         }
 
         _ => {
-            return syn::Error::new_spanned(expr, "mcall! expects a method call `obj.method(args)` or field access `obj.field`")
+            return syn::Error::new_spanned(expr, "mcall! expects a method call `obj.method(args)`, field access `obj.field`, or index `obj[i]`")
                 .to_compile_error()
                 .into();
         }
@@ -501,1017 +572,136 @@ pub fn mcall(input: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn relabel(input: TokenStream) -> TokenStream {
-    let parsed = parse_macro_input!(input as RelabelInput);
+    let RelabelInput { var, label } = parse_macro_input!(input as RelabelInput);
 
-    match parsed {
-        RelabelInput::Static { var, label } => {
-            // Reject mutable references: relabel!(&mut x, Label) is not allowed.
-            if let syn::Expr::Reference(ref_expr) = &var {
-                if ref_expr.mutability.is_some() {
-                    return syn::Error::new_spanned(&var, "relabel! cannot be used on mutable references (`&mut`)").to_compile_error().into();
-                }
-            }
-
-            let expanded = quote! {
-                {
-                    // Step 1: Normalize input via autoref specialization.
-                    // Labeled<T, L> → kept as Labeled<T, L>.
-                    // Raw T → wrapped as Labeled<T, Public>.
-                    struct __Wrap<V>(V);
-
-                    // Inherent: Labeled values pass through unchanged
-                    impl<T, L: typing_rules::lattice::Label> __Wrap<typing_rules::lattice::Labeled<T, L>> {
-                        fn __to_labeled(self) -> typing_rules::lattice::Labeled<T, L> {
-                            self.0
-                        }
-                    }
-
-                    // Trait fallback: raw values get wrapped as Labeled<T, Public>
-                    trait __AsPublic {
-                        type Inner;
-                        fn __to_labeled(self) -> typing_rules::lattice::Labeled<Self::Inner, typing_rules::lattice::Public>;
-                    }
-                    impl<T> __AsPublic for __Wrap<T> {
-                        type Inner = T;
-                        fn __to_labeled(self) -> typing_rules::lattice::Labeled<T, typing_rules::lattice::Public> {
-                            typing_rules::lattice::Labeled::new(self.0)
-                        }
-                    }
-
-                    // Step 2: Check LEQ and relabel.
-                    typing_rules::__relabel_checked::<_, _, #label>(__Wrap(#var).__to_labeled())
-                }
-            };
-            TokenStream::from(expanded)
-        }
-
-        RelabelInput::Nested { var, events, lt } => {
-            // 3-arg nested path: peel inner layer of DRLabel<T,S1,DRLabel<(),S2,F1,F2>,PfTo>
-            // Requires eventon before call — relabel_inner checks the guard at runtime.
-            let expanded = quote! {
-                {
-                    ::typing_rules::dynamic_release::relabel_inner::<_, _, _, _, _, _, _, #lt>(#var, #events)
-                }
-            };
-            TokenStream::from(expanded)
-        }
-
-        RelabelInput::Dynamic { var, events, lt, lx } => {
-            // 4-arg dynamic path: resolve outer layer of a flat DRLabel at runtime.
-            let expanded = quote! {
-                {
-                    ::typing_rules::dynamic_release::relabel::<_, _, _, _, #lt, #lx>(&#var, #events)
-                }
-            };
-            TokenStream::from(expanded)
+    // Reject mutable references: relabel!(&mut x, Label) is not allowed.
+    if let syn::Expr::Reference(ref_expr) = &var {
+        if ref_expr.mutability.is_some() {
+            return syn::Error::new_spanned(&var, "relabel! cannot be used on mutable references (`&mut`)").to_compile_error().into();
         }
     }
-}
-
-// =========================================================================
-// // =========================================================================
-// PC Block
-// // =========================================================================
-
-// =========================================================================
-// 1. PARSING INPUT
-// =========================================================================
-
-struct PcBlockInput {
-    start_label: syn::Type,
-    block: syn::Block,
-}
-
-impl Parse for PcBlockInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        // Parse optional label: (Label)
-        let start_label = if input.peek(syn::token::Paren) {
-            let content;
-            syn::parenthesized!(content in input);
-            let ty: syn::Type = content.parse()?;
-            ty
-        } else {
-            // Default to Public
-            syn::parse_quote!(::typing_rules::lattice::Public)
-        };
-
-        let block: syn::Block = input.parse()?;
-        Ok(PcBlockInput { start_label, block })
-    }
-}
-
-#[proc_macro]
-pub fn pc_block(tokens: TokenStream) -> TokenStream {
-    let PcBlockInput { start_label, block } = parse_macro_input!(tokens as PcBlockInput);
-
-    // 1. Generate EXECUTED Code (Runtime)
-    //    - Rewrites assignments to 'secure_assign_with_pc'
-    //    - Rewrites 'if' to track PC
-    //    - Calls allowlisted functions normally
-    let executed_code: TokenStream2 = expand_block(&block).into();
-
-    // 2. Generate CHECKING Code (Compile-Time Safety)
-    //    - Enforces Allowlist (errors on unknown functions)
-    //    - Enforces InvisibleSideEffectFree (ISEF) on method calls
-    //    - Checks Implicit Flow
-    let checking_code: TokenStream2 = check_block(&block).into();
 
     let expanded = quote! {
-        // ==========================================================
-        // MACRO TRUST BOUNDARY:
-        // The macro provides the `unsafe` context for `.unwrap()`
-        // because it has verified the Information Flow statically!
-        // In order to use vetted
-        // ==========================================================
-        unsafe {
-            if true {
-                // ── Panic message suppression ─────────────────────
-                // Suppress panic messages inside pc_block! to prevent
-                // secret data from leaking through panic payloads.
-                //
-                // Strategy:
-                //   1. Save the current hook and install a silent one.
-                //   2. A drop guard restores the hook on early `?`
-                //      return (normal unwinding, no panic in progress).
-                //   3. During panic unwinding, the guard skips
-                //      restoration (set_hook is not safe to call while
-                //      panicking); the silent hook stays and the panic
-                //      message remains suppressed.
-                //   4. On normal block completion, the guard drops
-                //      and restores the original hook.
-                let __pc_prev_hook = ::std::panic::take_hook();
-                ::std::panic::set_hook(::std::boxed::Box::new(|_| {}));
+        {
+            // Step 1: Normalize input via autoref specialization.
+            // Labeled<T, L> → kept as Labeled<T, L>.
+            // Raw T → wrapped as Labeled<T, Public>.
+            struct __Wrap<V>(V);
 
-                struct __PcPanicGuard(
-                    ::std::option::Option<
-                        ::std::boxed::Box<dyn ::std::ops::FnMut()>
-                    >
-                );
-                impl ::std::ops::Drop for __PcPanicGuard {
-                    fn drop(&mut self) {
-                        // Only restore the hook on normal cleanup
-                        // (e.g. early ? return). During panic unwinding
-                        // set_hook is not safe to call, and the silent
-                        // hook should remain active anyway.
-                        if !::std::thread::panicking() {
-                            if let ::std::option::Option::Some(mut f) = self.0.take() {
-                                f();
-                            }
-                        }
-                    }
+            // Inherent: Labeled values pass through unchanged
+            impl<T, L: typing_rules::lattice::Label> __Wrap<typing_rules::lattice::Labeled<T, L>> {
+                fn __to_labeled(self) -> typing_rules::lattice::Labeled<T, L> {
+                    self.0
                 }
-                let mut __pc_hook_opt = ::std::option::Option::Some(__pc_prev_hook);
-                let __pc_panic_guard = __PcPanicGuard(
-                    ::std::option::Option::Some(::std::boxed::Box::new(move || {
-                        if let ::std::option::Option::Some(hook) = __pc_hook_opt.take() {
-                            ::std::panic::set_hook(hook);
-                        }
-                    }))
-                );
-
-                // ── PC initialization and user code ───────────────
-                let __pc_temp: #start_label = ::std::mem::zeroed();
-                let __pc = __pc_temp;
-                #executed_code
-
-                // Normal exit — guard drops here, restoring the hook.
-                // (Also drops on early ? return or panic unwinding.)
-                drop(__pc_panic_guard);
-            } else {
-                // Initialize PC for Checking
-                let __pc_temp: #start_label = ::std::mem::zeroed();
-                let __pc = __pc_temp;
-                let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                #checking_code
             }
+
+            // Trait fallback: raw values get wrapped as Labeled<T, Public>
+            trait __AsPublic {
+                type Inner;
+                fn __to_labeled(self) -> typing_rules::lattice::Labeled<Self::Inner, typing_rules::lattice::Public>;
+            }
+            impl<T> __AsPublic for __Wrap<T> {
+                type Inner = T;
+                fn __to_labeled(self) -> typing_rules::lattice::Labeled<T, typing_rules::lattice::Public> {
+                    typing_rules::lattice::Labeled::new(self.0)
+                }
+            }
+
+            // Step 2: Check LEQ and relabel.
+            typing_rules::__relabel_checked::<_, _, #label>(__Wrap(#var).__to_labeled())
         }
     };
-
     TokenStream::from(expanded)
 }
 
 // =========================================================================
-// 2. EXECUTION LOGIC (Runtime Rewriter)
+// PC BLOCK (implementation in pc_block_expand.rs)
 // =========================================================================
 
-fn expand_expr(expr: &syn::Expr) -> TokenStream2 {
-    if let syn::Expr::Call(call) = expr {
-        let func_str = quote!(#call.func).to_string();
-        if func_str.contains("unchecked_operation") {
-            let inner = call.args.first().expect("unchecked_operation needs an argument");
-            // Return the raw, un-transformed tokens of the argument
-            return quote!(#inner);
-        }
-    }
-    match expr {
-        syn::Expr::If(i) => {
-            // Check if this is `if let` pattern (e.g., if let Some(x) = expr)
-            if let syn::Expr::Let(let_expr) = i.cond.as_ref() {
-                let pat = &let_expr.pat;
-                let scrutinee = expand_expr(&let_expr.expr);
-                let then_block = expand_block(&i.then_branch);
-                let else_block = match &i.else_branch {
-                    Some((_, e)) => {
-                        let e_trans = expand_expr(e);
-                        quote! { else { #e_trans } }
-                    }
-                    None => quote! {},
-                };
-                quote! {
-                    if let #pat = #scrutinee {
-                        #then_block
-                    }
-                    #else_block
-                }
-            } else {
-                let cond_expr = expand_expr(&i.cond);
-                let then_block = expand_block(&i.then_branch);
+mod pc_block_expand;
 
-                // [CHANGE 3] Ensure Else block is explicitly generated
-                let else_block = match &i.else_branch {
-                    Some((_, e)) => {
-                        let e_trans = expand_expr(e);
-                        // We must generate the 'else' block so types match the 'if' block
-                        quote! { else {
-                            let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __cond_label);
-                            let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                            #e_trans
-                        }}
-                    }
-                    None => quote! {}, // If user wrote no else, we generate no else
-                };
-
-                quote! {
-                    {
-                        // Inspect Condition
-                        let (__cond_val, __cond_label) = ::typing_rules::implicit::inspect_condition(#cond_expr);
-                        ::typing_rules::implicit::check_isef(__cond_val);
-
-                        // If/Else structure mirrors the user's code exactly
-                        if __cond_val {
-                            let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __cond_label);
-                            let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                            #then_block
-                        }
-                        #else_block
-                    }
-                }
-            }
-        }
-
-        // [B] ASSIGNMENTS (Flow Check)
-        syn::Expr::Assign(assign) => {
-            let lhs = &assign.left;
-            let rhs_expr = &assign.right;
-
-            // Special case: Labeled::new(...) without turbofish — preserve type inference
-            if let syn::Expr::Call(call) = rhs_expr.as_ref() {
-                let func_str = quote!(#call.func).to_string();
-                let is_labeled_new_no_turbofish = func_str.contains("Labeled") && func_str.contains("new") && !func_str.contains('<');
-                if is_labeled_new_no_turbofish || is_call_to_allowlisted_function(call) {
-                    let raw_func = &call.func;
-                    let args: Vec<_> = call.args.iter().map(|a| expand_expr(a)).collect();
-                    return quote! {
-                        {
-                            #lhs = #raw_func(#(#args),*);
-                            ::typing_rules::implicit::pc_guard_assign(&mut #lhs, __pc.clone());
-                        }
-                    };
-                }
-            }
-
-            let rhs = expand_expr(rhs_expr);
-            // Compute RHS first (may move #lhs if it appears in the expression),
-            // then reinitialize #lhs via assignment before taking &mut for the type check.
-            quote! {
-                {
-                    let __temp_rhs = #rhs;
-                    #lhs = __temp_rhs;
-                    let __lhs_clone = #lhs.clone();
-                    ::typing_rules::implicit::secure_assign_with_pc(&mut #lhs, __lhs_clone, __pc.clone())
-                }
-            }
-        }
-
-        // [C] COMPOUND ASSIGNMENTS (x += y)
-        syn::Expr::Binary(b) if is_compound_assign(&b.op) => {
-            let lhs = &b.left;
-            let rhs = expand_expr(&b.right);
-            let op = &b.op;
-            quote! {
-                {
-                    // Check implicit flow: PC <= LHS
-                    let __lhs_clone = #lhs.clone();
-                    ::typing_rules::implicit::secure_assign_with_pc(&mut #lhs, __lhs_clone, __pc.clone());
-                    #lhs #op #rhs
-                }
-            }
-        }
-
-        // [D] RECURSION
-        syn::Expr::Block(b) => expand_block(&b.block),
-        syn::Expr::While(w) => {
-            let cond = expand_expr(&w.cond);
-            let body = expand_block(&w.body);
-            let label = w.label.as_ref().map(|l| quote! { #l });
-            // Rewrite as `loop` + `break` so the condition label is captured
-            // each iteration and used to raise the PC inside the body.
-            quote! {
-                #label loop {
-                    let (__cond_val, __cond_label) = ::typing_rules::implicit::inspect_condition(#cond);
-                    if !__cond_val { break; }
-                    let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __cond_label);
-                    let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                    #body
-                }
-            }
-        }
-        syn::Expr::ForLoop(f) => {
-            let pat = &f.pat;
-            let expr = expand_expr(&f.expr);
-            let body = expand_block(&f.body);
-            let label = f.label.as_ref().map(|l| quote! { #l });
-            // Extract the iterator's label (if Labeled<I, L>) and raise PC for the body.
-            quote! {
-                {
-                    use ::typing_rules::implicit::IterWrapperFallback;
-                    let (__iter, __iter_label) = ::typing_rules::implicit::IterWrapper(#expr).inspect_iter();
-                    let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __iter_label);
-                    let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                    #label for #pat in __iter {
-                        #body
-                    }
-                }
-            }
-        }
-        syn::Expr::Loop(l) => {
-            let label = l.label.as_ref().map(|lbl| quote! { #lbl });
-            let body = expand_block(&l.body);
-            quote! { #label loop { #body } }
-        }
-
-        // [Expand] UNSAFE BLOCKS
-        syn::Expr::Unsafe(expr_unsafe) => {
-            // Wrap the syn::Block inside a syn::Expr::Block so our function can parse it
-            let block_expr = syn::Expr::Block(syn::ExprBlock {
-                attrs: expr_unsafe.attrs.clone(),
-                label: None,
-                block: expr_unsafe.block.clone(),
-            });
-
-            let inner = expand_expr(&block_expr);
-
-            // Note: We use `unsafe #inner` instead of `unsafe { #inner }`
-            // because a Block expression already provides its own curly braces!
-            quote! { unsafe #inner }
-        }
-
-        // [E] FUNCTION CALLS (Pass-through for execution)
-        // syn::Expr::Call(c) => {
-        //     let args = comma_separate(c.args.iter().map(expand_expr));
-        //     let func = &c.func;
-        //     quote! { #func(#args) }
-        // }
-        // [Expand] FUNCTION CALLS
-        syn::Expr::Call(call) => {
-            let func = expand_expr(&call.func);
-            let args: Vec<_> = call.args.iter().map(|arg| expand_expr(arg)).collect();
-            let unwrapped_names: Vec<_> = (0..args.len()).map(|i| quote::format_ident!("__v{}", i)).collect();
-
-            let inner_call = quote! { #func( #(#unwrapped_names),* ) };
-
-            // FIX: Prevent double-wrapping Labeled::new
-            let func_str = quote!(#func).to_string();
-            let is_labeled_new = func_str.contains("Labeled") && func_str.contains("new");
-
-            let mut expanded = if is_labeled_new || is_call_to_allowlisted_function(call) {
-                quote! { #inner_call }
-            } else {
-                quote! { {
-                    use ::typing_rules::implicit::PcCallResultFallback;
-                    ::typing_rules::implicit::PcCallResult.wrap_result(#inner_call)
-                } }
-            };
-
-            for (arg, name) in args.iter().zip(unwrapped_names.iter()).rev() {
-                expanded = quote! { (#arg).__chain(|#name| { #expanded }) };
-            }
-            quote! { { use ::typing_rules::function_rewrite::SecureChain; #expanded } }
-        }
-
-        syn::Expr::MethodCall(m) => {
-            let receiver = expand_expr(&m.receiver);
-            let method_name = &m.method;
-            let turbofish = &m.turbofish;
-            let args: Vec<_> = m.args.iter().map(|arg| expand_expr(arg)).collect();
-            // Pass method calls through directly without chain/wrap transformation.
-            // Methods marked #[side_effect_free_attr] already handle Labeled types
-            // and return Vetted<T> for safety verification.
-            quote! { #receiver.#method_name #turbofish (#(#args),*) }
-        }
-
-        // [G] MACROS — format! is treated like fcall (chain args, wrap result)
-        syn::Expr::Macro(m) => {
-            let name = m.mac.path.segments.last().map(|s| s.ident.to_string());
-            if name.as_deref() == Some("format") {
-                // Parse format! arguments: format!("...", arg1, arg2, ...)
-                let tokens = m.mac.tokens.clone();
-                let parsed = syn::parse::Parser::parse2(syn::punctuated::Punctuated::<Expr, Token![,]>::parse_terminated, tokens).expect("format! should contain comma-separated expressions");
-                let mut items = parsed.iter();
-                let fmt_str = items.next().expect("format! needs a format string");
-                let args: Vec<&Expr> = items.collect();
-
-                if args.is_empty() {
-                    // No args to chain — just wrap the result
-                    quote! {
-                        ::typing_rules::lattice::Labeled::<_, ::typing_rules::lattice::Public>::new(
-                            format!(#fmt_str)
-                        )
-                    }
-                } else {
-                    let unwrapped_names: Vec<_> = (0..args.len()).map(|i| format_ident!("__v{}", i)).collect();
-                    let expanded_args: Vec<_> = args.iter().map(|a| expand_expr(a)).collect();
-
-                    let mut expanded = quote! {
-                        ::typing_rules::lattice::Labeled::<_, ::typing_rules::lattice::Public>::new(
-                            format!(#fmt_str, #(#unwrapped_names),*)
-                        )
-                    };
-
-                    for (arg, name) in expanded_args.iter().zip(unwrapped_names.iter()).rev() {
-                        expanded = quote! { (#arg).__chain(|#name| { #expanded }) };
-                    }
-
-                    quote! { { use ::typing_rules::function_rewrite::SecureChain; #expanded } }
-                }
-            } else {
-                // Other macros: pass-through
-                expr.to_token_stream()
-            }
-        }
-
-        // [H] RETURN STATEMENTS (Pass-through)
-        syn::Expr::Return(r) => {
-            let val = r.expr.as_ref().map(|e| expand_expr(e));
-            quote! { return #val; }
-        }
-
-        // UNARY OPERATORS (!, -) → recursively transform operand
-        syn::Expr::Unary(u) => {
-            let op = u.op;
-            let expr = expand_expr(&u.expr);
-            quote! { #op #expr }
-        }
-
-        // COMPARISON OPERATORS (==, !=) → labeled comparison preserving security labels
-        syn::Expr::Binary(b) if is_comparison_op(&b.op) => {
-            let lhs = expand_expr(&b.left);
-            let rhs = expand_expr(&b.right);
-            match &b.op {
-                syn::BinOp::Eq(_) => quote! {
-                    { use ::typing_rules::operations::LabeledCmp; (#lhs).labeled_eq(#rhs) }
-                },
-                syn::BinOp::Ne(_) => quote! {
-                    { use ::typing_rules::operations::LabeledCmp; (#lhs).labeled_ne(#rhs) }
-                },
-                _ => unreachable!(),
-            }
-        }
-        // LOGICAL OPERATORS (&&, ||) → labeled logical preserving security labels
-        syn::Expr::Binary(b) if is_logical_op(&b.op) => {
-            let lhs = expand_expr(&b.left);
-            let rhs = expand_expr(&b.right);
-            match &b.op {
-                syn::BinOp::And(_) => quote! {
-                    { use ::typing_rules::operations::LabeledAnd; (#lhs).labeled_and((#rhs).clone()) }
-                },
-                syn::BinOp::Or(_) => quote! {
-                    { use ::typing_rules::operations::LabeledOr; (#lhs).labeled_or((#rhs).clone()) }
-                },
-                _ => unreachable!(),
-            }
-        }
-
-        // [I] STRUCT LITERALS
-        syn::Expr::Struct(s) => {
-            let path = &s.path;
-            let fields = s.fields.iter().map(|f| {
-                let member = &f.member;
-                let val = expand_expr(&f.expr);
-                quote! { #member: #val }
-            });
-            let rest = s.rest.as_ref().map(|r| {
-                let r = expand_expr(r);
-                quote! { ..#r }
-            });
-            quote! { #path { #(#fields),* #rest } }
-        }
-
-        // [J] FALLBACK
-        _ => expr.to_token_stream(),
-    }
+/// `pc_block!((Label) { .. })`: runs a block under a PC label with
+/// Cocoon-style side-effect checking. See `pc_block_expand` for the rules.
+#[proc_macro]
+pub fn pc_block(tokens: TokenStream) -> TokenStream {
+    pc_block_expand::pc_block_impl(tokens)
 }
 
-fn expand_block(input: &syn::Block) -> TokenStream2 {
-    let stmts = input.stmts.iter().map(|stmt| match stmt {
-        syn::Stmt::Expr(e, semi) => {
-            let expanded = expand_expr(e);
-            if semi.is_some() {
-                quote! { #expanded; }
-            } else {
-                expanded
-            }
-        }
-        syn::Stmt::Local(l) => {
-            let pat = &l.pat;
-            let init = l.init.as_ref().map(|init| {
-                let ex = expand_expr(&init.expr);
-                quote! { = #ex }
-            });
-            quote! { let #pat #init; }
-        }
-        syn::Stmt::Macro(m) => m.to_token_stream(),
-        _ => stmt.to_token_stream(),
-    });
-    quote! { { #(#stmts)* } }
-}
 
 // =========================================================================
-// 3. CHECKING
+// SIDE-EFFECT-FREE ATTRIBUTE (implementation in side_effect_free.rs)
 // =========================================================================
 
-fn check_expr(expr: &syn::Expr) -> TokenStream2 {
-    if let syn::Expr::Call(call) = expr {
-        let func_str = quote!(#call.func).to_string();
-        if func_str.contains("unchecked_operation") {
-            let inner = call.args.first().expect("unchecked_operation needs an argument");
-            // Return the raw, un-transformed tokens of the argument
-            return quote!(#inner);
-        }
-    }
+mod side_effect_free;
 
-    match expr {
-        // [A] IF STATEMENTS (Must track PC here too)
-        syn::Expr::If(i) => {
-            // Check if this is `if let` pattern (e.g., if let Some(x) = expr)
-            if let syn::Expr::Let(let_expr) = i.cond.as_ref() {
-                let pat = &let_expr.pat;
-                let scrutinee = check_expr(&let_expr.expr);
-                let then_block = check_block(&i.then_branch);
-                let else_block = match &i.else_branch {
-                    Some((_, e)) => {
-                        let e_trans = check_expr(e);
-                        quote! { else { #e_trans } }
-                    }
-                    None => quote! {},
-                };
-                quote! {
-                    if let #pat = #scrutinee {
-                        #then_block
-                    }
-                    #else_block
-                }
-            } else {
-                let cond_expr = check_expr(&i.cond);
-                let then_block = check_block(&i.then_branch);
-                let else_block = match &i.else_branch {
-                    Some((_, e)) => {
-                        let e_trans = check_expr(e);
-                        quote! { else {
-                            let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __cond_label);
-                            let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                            #e_trans
-                        }}
-                    }
-                    None => quote! {},
-                };
-
-                quote! {
-                    {
-                        // Inspect Condition & Check Side Effects
-                        let (__cond_val, __cond_label) = ::typing_rules::implicit::inspect_condition(#cond_expr);
-                        ::typing_rules::implicit::check_isef(__cond_val);
-
-                        if __cond_val {
-                            let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __cond_label);
-                            let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                            #then_block
-                        }
-                        #else_block
-                    }
-                }
-            }
-        }
-
-        // [B] ASSIGNMENTS (Flow Check)
-        syn::Expr::Assign(assign) => {
-            let lhs = &assign.left;
-            let rhs_expr = &assign.right;
-
-            // Special case: if RHS is `Labeled::new(...)` WITHOUT a turbofish
-            // label parameter, emit a raw assignment + PC-only guard.
-            // This preserves type inference (L is inferred from the LHS),
-            // while still enforcing PC ⊑ Dest.
-            if let syn::Expr::Call(call) = rhs_expr.as_ref() {
-                let func_str = quote!(#call.func).to_string();
-                let is_labeled_new_no_turbofish = func_str.contains("Labeled") && func_str.contains("new") && !func_str.contains('<');
-                if is_labeled_new_no_turbofish || is_call_to_allowlisted_function(call) {
-                    let raw_func = &call.func;
-                    let args: Vec<_> = call.args.iter().map(|a| check_expr(a)).collect();
-                    return quote! {
-                        {
-                            #lhs = #raw_func(#(#args),*);
-                            ::typing_rules::implicit::pc_guard_assign(&mut #lhs, __pc.clone());
-                        }
-                    };
-                }
-            }
-
-            let rhs = check_expr(rhs_expr);
-            quote! {
-                {
-                    let __temp_rhs = #rhs;
-                    #lhs = __temp_rhs;
-                    let __lhs_clone = #lhs.clone();
-                    ::typing_rules::implicit::secure_assign_with_pc(&mut #lhs, __lhs_clone, __pc.clone())
-                }
-            }
-        }
-
-        // [C] COMPOUND ASSIGNMENTS
-        syn::Expr::Binary(b) if is_compound_assign(&b.op) => {
-            let lhs = &b.left;
-            let rhs = check_expr(&b.right);
-            let op = &b.op;
-            quote! {
-                {
-                    let __lhs_clone = #lhs.clone();
-                    ::typing_rules::implicit::secure_assign_with_pc(&mut #lhs, __lhs_clone, __pc.clone());
-                    #lhs #op #rhs
-                }
-            }
-        }
-
-        syn::Expr::Unsafe(expr_unsafe) => {
-            // Wrap the syn::Block inside a syn::Expr::Block
-            let block_expr = syn::Expr::Block(syn::ExprBlock {
-                attrs: expr_unsafe.attrs.clone(),
-                label: None,
-                block: expr_unsafe.block.clone(),
-            });
-
-            let inner = check_expr(&block_expr);
-            quote! { unsafe #inner }
-        }
-
-        // [D] FUNCTION CALLS (Verification Path)
-        // [Check] FUNCTION CALLS
-        syn::Expr::Call(call) => {
-            let raw_func = &call.func;
-            let func_str = quote!(#raw_func).to_string();
-            let is_labeled_new = func_str.contains("Labeled") && func_str.contains("new");
-
-            // The function's RESULT is already checked via PcCallResult.wrap_result(check_isef(...)).
-            // Applying check_expr to the function path would wrap the function item
-            // type in check_isef, which fails because fn items don't impl ISEF.
-            let func = quote! { #raw_func };
-
-            let args: Vec<_> = call.args.iter().map(|arg| check_expr(arg)).collect();
-            let unwrapped_names: Vec<_> = (0..args.len()).map(|i| quote::format_ident!("__v{}", i)).collect();
-
-            let raw_call = quote! { #func( #(#unwrapped_names),* ) };
-
-            // Do not wrap the trusted execution in check_isef!
-            let mut expanded = if is_labeled_new || is_call_to_allowlisted_function(call) {
-                // Trust Labeled::new and allowlisted functions. Pass through!
-                quote! { #raw_call }
-            } else {
-                // - Vetted<T> returns (from #[side_effect_free_attr]) → unwraps to T
-                // - Raw T returns → wraps in Labeled<T, Public>
-                let checked_call = quote! { ::typing_rules::implicit::check_isef(#raw_call) };
-                quote! { {
-                    use ::typing_rules::implicit::PcCallResultFallback;
-                    ::typing_rules::implicit::PcCallResult.wrap_result(#checked_call)
-                } }
-            };
-
-            for (arg, name) in args.iter().zip(unwrapped_names.iter()).rev() {
-                expanded = quote! { (#arg).__chain(|#name| { #expanded }) };
-            }
-            quote! { { use ::typing_rules::function_rewrite::SecureChain; #expanded } }
-        }
-
-        // [E] METHOD CALLS (Side-Effect Check)
-        syn::Expr::MethodCall(m) => {
-            // Pass method calls through directly without transformation.
-            // Safety is enforced by the type system: #[side_effect_free_attr]
-            // methods return Vetted<T> which proves they are side-effect free.
-            m.to_token_stream()
-        }
-
-        // [F] RECURSION
-        syn::Expr::Block(b) => check_block(&b.block),
-        syn::Expr::While(w) => {
-            let cond = check_expr(&w.cond);
-            let body = check_block(&w.body);
-            let label = w.label.as_ref().map(|l| quote! { #l });
-            quote! {
-                #label loop {
-                    let (__cond_val, __cond_label) = ::typing_rules::implicit::inspect_condition(#cond);
-                    if !__cond_val { break; }
-                    let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __cond_label);
-                    let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                    #body
-                }
-            }
-        }
-        syn::Expr::ForLoop(f) => {
-            let pat = &f.pat;
-            let expr = check_expr(&f.expr);
-            let body = check_block(&f.body);
-            let label = f.label.as_ref().map(|l| quote! { #l });
-            quote! {
-                {
-                    use ::typing_rules::implicit::IterWrapperFallback;
-                    let (__iter, __iter_label) = ::typing_rules::implicit::IterWrapper(#expr).inspect_iter();
-                    let __pc = ::typing_rules::implicit::join_labels(__pc.clone(), __iter_label);
-                    let __pc_checker = ::typing_rules::implicit::PcIsef::new(&__pc);
-                    #label for #pat in __iter {
-                        #body
-                    }
-                }
-            }
-        }
-        syn::Expr::Loop(l) => {
-            let label = l.label.as_ref().map(|lbl| quote! { #lbl });
-            let body = check_block(&l.body);
-            quote! { #label loop { #body } }
-        }
-
-        // [G] BASIC EXPRESSIONS
-        syn::Expr::Paren(p) => {
-            let inner = check_expr(&p.expr);
-            quote! { (#inner) }
-        }
-        // COMPARISON OPERATORS (==, !=) → labeled comparison preserving security labels
-        syn::Expr::Binary(b) if is_comparison_op(&b.op) => {
-            let lhs = check_expr(&b.left);
-            let rhs = check_expr(&b.right);
-            match &b.op {
-                syn::BinOp::Eq(_) => quote! {
-                    { use ::typing_rules::operations::LabeledCmp; (#lhs).labeled_eq(#rhs) }
-                },
-                syn::BinOp::Ne(_) => quote! {
-                    { use ::typing_rules::operations::LabeledCmp; (#lhs).labeled_ne(#rhs) }
-                },
-                _ => unreachable!(),
-            }
-        }
-        // LOGICAL OPERATORS (&&, ||) → labeled logical preserving security labels
-        syn::Expr::Binary(b) if is_logical_op(&b.op) => {
-            let lhs = check_expr(&b.left);
-            let rhs = check_expr(&b.right);
-            match &b.op {
-                syn::BinOp::And(_) => quote! {
-                    { use ::typing_rules::operations::LabeledAnd; (#lhs).labeled_and((#rhs).clone()) }
-                },
-                syn::BinOp::Or(_) => quote! {
-                    { use ::typing_rules::operations::LabeledOr; (#lhs).labeled_or((#rhs).clone()) }
-                },
-                _ => unreachable!(),
-            }
-        }
-        syn::Expr::Binary(b) => {
-            let lhs = check_expr(&b.left);
-            let rhs = check_expr(&b.right);
-            let op = b.op;
-            quote! { #lhs #op #rhs }
-        }
-        syn::Expr::Unary(u) => {
-            let op = u.op;
-            let expr = check_expr(&u.expr);
-            quote! { #op #expr }
-        }
-        // Reading a variable has no side effect — ISEF check is for function calls, not reads.
-        syn::Expr::Path(p) => p.to_token_stream(),
-        syn::Expr::Lit(l) => l.into_token_stream(),
-        syn::Expr::Field(f) => {
-            let base = check_expr(&f.base);
-            let member = &f.member;
-            quote! { (#base).#member }
-        }
-        syn::Expr::Index(idx) => {
-            let expr = check_expr(&idx.expr);
-            let index = check_expr(&idx.index);
-            quote! { #expr[#index] }
-        }
-
-        // [H] MACROS — format! is side-effect-free; reject others under non-Public PC
-        syn::Expr::Macro(m) => {
-            let name = m.mac.path.segments.last().map(|s| s.ident.to_string());
-            let name_str = name.as_deref().unwrap_or("");
-            match name_str {
-                "fcall" | "mcall" | "relabel" | "pc_block" | "panic" => m.to_token_stream(),
-                "format" => {
-                    // Transform format! the same way as expand_expr: chain args, wrap result.
-                    // Needed because the checking branch must still compile (Labeled has no Display).
-                    let tokens = m.mac.tokens.clone();
-                    let parsed = syn::parse::Parser::parse2(syn::punctuated::Punctuated::<Expr, Token![,]>::parse_terminated, tokens).expect("format! should contain comma-separated expressions");
-                    let mut items = parsed.iter();
-                    let fmt_str = items.next().expect("format! needs a format string");
-                    let args: Vec<&Expr> = items.collect();
-
-                    if args.is_empty() {
-                        quote! {
-                            ::typing_rules::lattice::Labeled::<_, ::typing_rules::lattice::Public>::new(
-                                format!(#fmt_str)
-                            )
-                        }
-                    } else {
-                        let unwrapped_names: Vec<_> = (0..args.len()).map(|i| format_ident!("__v{}", i)).collect();
-                        let checked_args: Vec<_> = args.iter().map(|a| check_expr(a)).collect();
-
-                        let mut expanded = quote! {
-                            ::typing_rules::lattice::Labeled::<_, ::typing_rules::lattice::Public>::new(
-                                format!(#fmt_str, #(#unwrapped_names),*)
-                            )
-                        };
-
-                        for (arg, name) in checked_args.iter().zip(unwrapped_names.iter()).rev() {
-                            expanded = quote! { (#arg).__chain(|#name| { #expanded }) };
-                        }
-
-                        quote! { { use ::typing_rules::function_rewrite::SecureChain; #expanded } }
-                    }
-                }
-                _ => {
-                    let mac = &m.mac;
-                    quote! {
-                        {
-                            use ::typing_rules::implicit::PcIsefFallback;
-                            __pc_checker.reject_side_effecting_macro(#mac)
-                        }
-                    }
-                }
-            }
-        }
-
-        // [I] RETURN STATEMENTS (Pass-through)
-        syn::Expr::Return(r) => {
-            let val = r.expr.as_ref().map(|e| check_expr(e));
-            quote! { return #val; }
-        }
-
-        // [NEW 1] ARRAYS: [a, b, c]
-        syn::Expr::Array(a) => {
-            let elems = comma_separate(a.elems.iter().map(check_expr));
-            quote! { [#elems] }
-        }
-
-        // [NEW 2] REFERENCES: &x or &mut x
-        syn::Expr::Reference(r) => {
-            let e = check_expr(&r.expr);
-            if r.mutability.is_some() {
-                quote! { &mut #e }
-            } else {
-                quote! { &#e }
-            }
-        }
-
-        // (format!/cfg! etc. handled by the [H] MACROS arm above)
-
-        // STRUCT LITERALS — pass through as-is; the Rust type system
-        // enforces IFC constraints via the Labeled field types.
-        syn::Expr::Struct(_) => expr.to_token_stream(),
-
-        _ => {
-            // If we don't recognize it, it might be unsafe.
-            // We can emit a compile error or just try to pass it through.
-            // For safety, let's error on unknown syntax in the checked block.
-            let msg = format!("Syntax not supported in pc_block (checked path): {:?}", quote! {#expr}.to_string());
-            quote! { compile_error!(#msg); }
-        }
-    }
-}
-
-fn check_block(input: &syn::Block) -> TokenStream2 {
-    let stmts = input.stmts.iter().map(|stmt| match stmt {
-        syn::Stmt::Expr(e, semi) => {
-            let checked = check_expr(e);
-            if semi.is_some() {
-                quote! { #checked; }
-            } else {
-                checked
-            }
-        }
-        syn::Stmt::Local(l) => {
-            let pat = &l.pat;
-            let init = l.init.as_ref().map(|init| {
-                let ex = check_expr(&init.expr);
-                quote! { = #ex }
-            });
-            quote! { let #pat #init; }
-        }
-        syn::Stmt::Macro(m) => {
-            let name = m.mac.path.segments.last().map(|s| s.ident.to_string());
-            let name_str = name.as_deref().unwrap_or("");
-            // Safe macros: cfg!, and our own IFC macros which enforce their own checking.
-            match name_str {
-                "fcall" | "mcall" | "relabel" | "pc_block" | "panic" | "format" => m.to_token_stream(),
-                _ => {
-                    // Side-effecting macros (println!, panic!, etc.) are rejected
-                    // under non-Public PC via MacroSideEffectFree bound.
-                    let mac = &m.mac;
-                    let semi = &m.semi_token;
-                    quote! {
-                        {
-                            use ::typing_rules::implicit::PcIsefFallback;
-                            __pc_checker.reject_side_effecting_macro(#mac);
-                        } #semi
-                    }
-                }
-            }
-        }
-        _ => stmt.to_token_stream(),
-    });
-    quote! { { #(#stmts)* } }
-}
-
-// =========================================================================
-// 2. SIDE EFFECT FREE ATTRIBUTE (Same as Cocoon's, but also supports Structs for auto-deriving InvisibleSideEffectFree)
-// =========================================================================
-
+/// Cocoon's `#[side_effect_free_attr]`: on a function, adds a checked copy of
+/// the body and wraps the result in `Vetted`; on a struct or enum, implements
+/// `InvisibleSideEffectFree` (Cocoon's `#[derive(InvisibleSideEffectFree)]`).
 #[proc_macro_attribute]
-pub fn side_effect_free_attr(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as syn::Item);
-
-    match input {
-        // [A] Mark a Function as Safe
-        syn::Item::Fn(mut func) => {
-            // 1. Extract the original return type
-            let orig_return_type = match &func.sig.output {
-                syn::ReturnType::Default => quote! { () },
-                syn::ReturnType::Type(_, ty) => quote! { #ty },
-            };
-
-            // 2. Change the signature to return Vetted<T>
-            func.sig.output = syn::parse_quote! {
-                -> ::typing_rules::implicit::Vetted<#orig_return_type>
-            };
-
-            let orig_block = &func.block;
-
-            // 3. THE CLOSURE TRAP:
-            // Wrap the body in a closure so early `return;` statements
-            // exit the closure instead of skipping the Vetted wrapper!
-            func.block = syn::parse_quote! {
-                {
-                    let mut __cocoon_inner = || -> #orig_return_type #orig_block;
-
-                    unsafe {
-                        ::typing_rules::implicit::Vetted::wrap( __cocoon_inner() )
-                    }
-                }
-            };
-
-            quote! { #func }.into()
-        }
-
-        // [B] Mark a Struct as Safe (Auto-Derive InvisibleSideEffectFree)
-        // Usage: #[side_effect_free_attr] struct MySafeData { ... }
-        syn::Item::Struct(s) => {
-            let name = &s.ident;
-            let (impl_generics, ty_generics, where_clause) = s.generics.split_for_impl();
-
-            // Generate the safety trait implementation
-            let expanded = quote! {
-                #s
-
-                unsafe impl #impl_generics ::typing_rules::implicit::InvisibleSideEffectFree for #name #ty_generics #where_clause {
-                     // We could optionally add checks for fields here
-                }
-            };
-            expanded.into()
-        }
-
-        _ => {
-            // Pass through other items
-            let item = input.to_token_stream();
-            quote! { #item }.into()
-        }
-    }
+pub fn side_effect_free_attr(attr: TokenStream, item: TokenStream) -> TokenStream {
+    side_effect_free::side_effect_free_attr_impl(attr, item)
 }
 
 // =========================================================================
-// 4. HELPERS & ALLOWLIST
+// HELPERS & ALLOWLIST
 // =========================================================================
 
-fn make_check_safe(e: TokenStream2) -> TokenStream2 {
-    quote! {
-        // { ::typing_rules::implicit::check_isef(#e) }
-        ::typing_rules::implicit::check_isef(#e)
-    }
+/// The operator whitelist: which binary operators may appear in a checked
+/// context, and the `safe_ops` trait and method each maps to.
+///
+/// Single source of truth — both `pc_block!` and `#[side_effect_free_attr]`
+/// dispatch through this, so an operator cannot be accepted by one and
+/// rejected by the other. `None` means "not permitted"; each caller turns
+/// that into its own diagnostic.
+pub(crate) fn safe_binop(op: &syn::BinOp) -> Option<(&'static str, &'static str)> {
+    use syn::BinOp::*;
+    Some(match op {
+        // comparisons
+        Eq(_) => ("SafeCmp", "safe_eq"),
+        Ne(_) => ("SafeCmp", "safe_ne"),
+        Lt(_) => ("SafeCmp", "safe_lt"),
+        Gt(_) => ("SafeCmp", "safe_gt"),
+        Le(_) => ("SafeCmp", "safe_le"),
+        Ge(_) => ("SafeCmp", "safe_ge"),
+        // arithmetic and bitwise
+        Add(_) => ("SafeAdd", "safe_add"),
+        Sub(_) => ("SafeSub", "safe_sub"),
+        Mul(_) => ("SafeMul", "safe_mul"),
+        Div(_) => ("SafeDiv", "safe_div"),
+        Rem(_) => ("SafeRem", "safe_rem"),
+        BitAnd(_) => ("SafeBitAnd", "safe_bitand"),
+        BitOr(_) => ("SafeBitOr", "safe_bitor"),
+        BitXor(_) => ("SafeBitXor", "safe_bitxor"),
+        Shl(_) => ("SafeShl", "safe_shl"),
+        Shr(_) => ("SafeShr", "safe_shr"),
+        // compound assigns — `is_compound_assign` selects exactly this set
+        AddAssign(_) => ("SafeAddAssign", "safe_add_assign"),
+        SubAssign(_) => ("SafeSubAssign", "safe_sub_assign"),
+        MulAssign(_) => ("SafeMulAssign", "safe_mul_assign"),
+        DivAssign(_) => ("SafeDivAssign", "safe_div_assign"),
+        RemAssign(_) => ("SafeRemAssign", "safe_rem_assign"),
+        BitAndAssign(_) => ("SafeBitAndAssign", "safe_bitand_assign"),
+        BitOrAssign(_) => ("SafeBitOrAssign", "safe_bitor_assign"),
+        BitXorAssign(_) => ("SafeBitXorAssign", "safe_bitxor_assign"),
+        ShlAssign(_) => ("SafeShlAssign", "safe_shl_assign"),
+        ShrAssign(_) => ("SafeShrAssign", "safe_shr_assign"),
+        _ => return None,
+    })
 }
+
+/// Unary `-` and `!`. Companion to [`safe_binop`].
+pub(crate) fn safe_unop(op: &syn::UnOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        syn::UnOp::Neg(_) => ("SafeNeg", "safe_neg"),
+        syn::UnOp::Not(_) => ("SafeNot", "safe_not"),
+        _ => return None,
+    })
+}
+
+/// The operators `safe_binop` accepts, for diagnostics. Kept next to the
+/// table so the message cannot drift from what is actually permitted.
+pub(crate) const SUPPORTED_OPS: &str =
+    "+ - * / % & | ^ << >> == != < > <= >= && || and their compound assigns";
 
 fn is_compound_assign(op: &syn::BinOp) -> bool {
     matches!(
@@ -1521,16 +711,24 @@ fn is_compound_assign(op: &syn::BinOp) -> bool {
             | syn::BinOp::MulAssign(_)
             | syn::BinOp::DivAssign(_)
             | syn::BinOp::RemAssign(_)
-            | syn::BinOp::BitXorAssign(_)
             | syn::BinOp::BitAndAssign(_)
             | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::BitXorAssign(_)
             | syn::BinOp::ShlAssign(_)
             | syn::BinOp::ShrAssign(_)
     )
 }
 
 fn is_comparison_op(op: &syn::BinOp) -> bool {
-    matches!(op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+    matches!(
+        op,
+        syn::BinOp::Eq(_)
+            | syn::BinOp::Ne(_)
+            | syn::BinOp::Lt(_)
+            | syn::BinOp::Gt(_)
+            | syn::BinOp::Le(_)
+            | syn::BinOp::Ge(_)
+    )
 }
 
 fn is_logical_op(op: &syn::BinOp) -> bool {
@@ -1548,47 +746,39 @@ fn comma_separate<T: Iterator<Item = TokenStream2>>(ts: T) -> TokenStream2 {
     tokens
 }
 
-// THE ALLOWLIST (Ported from Cocoon's lib.rs)
-fn is_call_to_allowlisted_function(call: &syn::ExprCall) -> bool {
-    let allowed_functions = HashSet::from([
-        // [Cocoon Standard Primitives]
-        "char::is_digit".to_string(),
-        "core::primitive::str::len".to_string(),
-        "std::clone::Clone::clone".to_string(),
-        "std::cmp::min".to_string(),
-        "std::cmp::max".to_string(),
-        "std::fs::File::open".to_string(),
-        "std::iter::Iterator::next".to_string(),
-        "std::iter::Iterator::take".to_string(),
-        "std::iter::zip".to_string(),
-        "std::option::Option::Some".to_string(),
-        "std::option::Option::unwrap".to_string(),
-        "std::string::String::clear".to_string(),
-        "std::string::String::from".to_string(),
-        "std::string::String::len".to_string(),
-        "std::time::Instant::now".to_string(),
-        "std::vec::Vec::new".to_string(),
-        "std::vec::Vec::push".to_string(),
-        "std::vec::Vec::len".to_string(),
-        "std::vec::Vec::with_capacity".to_string(),
-        "std::collections::HashMap::get".to_string(),
-        "std::collections::HashMap::insert".to_string(),
-        "std::collections::HashSet::insert".to_string(),
-        "str::to_string".to_string(),
-        "usize::to_string".to_string(),
-        // [Safe Ops from Lattice]
-        "typing_rules::lattice::safe_add".to_string(),
-        "typing_rules::lattice::safe_sub".to_string(),
-        "Labeled::new".to_string(),
-        "typing_rules::lattice::Labeled::new".to_string(),
-        // Add others as needed...
-    ]);
-
-    if let syn::Expr::Path(path_expr) = &*call.func {
-        let mut path_str = quote! {#path_expr}.to_string();
-        path_str.retain(|c| !c.is_whitespace());
-        allowed_functions.contains(&path_str)
-    } else {
-        false
+/// Std functions callable, fully qualified, from checked code (Cocoon's
+/// allowlist). Returns the canonical absolute path to emit, so neither an
+/// application module named `std` nor a type shadowing a primitive can stand
+/// in for the real item.
+///
+/// Left out on purpose: functions that run application code through a
+/// generic bound (`Clone::clone`, `cmp::min` / `max`, `Iterator::next` /
+/// `take`, `iter::zip`, `String::from`), map and set operations whose result
+/// reveals labeled keys (`HashMap::get` / `insert`, `HashSet::insert` — the
+/// `safe_methods` versions restrict keys), and I/O (`File::open`).
+fn allowlisted_path(call: &syn::ExprCall) -> Option<TokenStream2> {
+    let Expr::Path(p) = &*call.func else { return None };
+    if p.qself.is_some() {
+        return None;
     }
+    let mut full = quote!(#p).to_string();
+    full.retain(|c| !c.is_whitespace());
+    let key = full.strip_prefix("::").unwrap_or(&full);
+    Some(match key {
+        "char::is_digit" | "core::primitive::char::is_digit" => quote! { ::core::primitive::char::is_digit },
+        "str::len" | "core::primitive::str::len" => quote! { ::core::primitive::str::len },
+        "str::to_string" => quote! { <::core::primitive::str as ::std::string::ToString>::to_string },
+        "usize::to_string" => quote! { <::core::primitive::usize as ::std::string::ToString>::to_string },
+        "std::option::Option::Some" => quote! { ::std::option::Option::Some },
+        "std::option::Option::unwrap" => quote! { ::std::option::Option::unwrap },
+        "std::string::String::new" => quote! { ::std::string::String::new },
+        "std::string::String::clear" => quote! { ::std::string::String::clear },
+        "std::string::String::len" => quote! { ::std::string::String::len },
+        "std::time::Instant::now" => quote! { ::std::time::Instant::now },
+        "std::vec::Vec::new" => quote! { ::std::vec::Vec::new },
+        "std::vec::Vec::with_capacity" => quote! { ::std::vec::Vec::with_capacity },
+        "std::vec::Vec::push" => quote! { ::std::vec::Vec::push },
+        "std::vec::Vec::len" => quote! { ::std::vec::Vec::len },
+        _ => return None,
+    })
 }

@@ -9,6 +9,7 @@ use super::{
 use anyhow::{anyhow, Result};
 use clap::ArgMatches;
 
+// Handle the different subcommands
 pub async fn handle_matches(
   matches: &ArgMatches<'_>,
   cmd: String,
@@ -32,9 +33,10 @@ pub async fn handle_matches(
     None => Vec::new(),
   };
 
+  // If the device_id is not specified, select the first available device
   let device_id = cli.net.client_config.device_id.clone();
   if device_id.is_none() || !devices_list.contains(&device_id.unwrap()) {
-    
+    // Select the first device available
     if let Some(d) = devices_list.get(0) {
       cli.net.client_config.set_device_id(d.clone())?;
     }
@@ -44,23 +46,27 @@ pub async fn handle_matches(
     cli.set_device(d.to_string()).await?;
   }
 
+  // Evalute the subcommand
   let output = match cmd.as_str() {
     "playback" => {
       let format = matches.value_of("format").unwrap();
 
+      // Commands that are 'single'
       if matches.is_present("share-track") {
         return cli.share_track_or_episode().await;
       } else if matches.is_present("share-album") {
         return cli.share_album_or_show().await;
       }
 
+      // Run the action, and print out the status
+      // No 'else if's because multiple different commands are possible
       if matches.is_present("toggle") {
         cli.toggle_playback().await;
       }
       if let Some(d) = matches.value_of("transfer") {
         cli.transfer_playback(d).await?;
       }
-      
+      // Multiple flags are possible
       if matches.is_present("flags") {
         let flags = Flag::from_matches(matches);
         for f in flags {
@@ -80,6 +86,7 @@ pub async fn handle_matches(
         cli.seek(secs.to_string()).await?;
       }
 
+      // Print out the status if no errors were found
       cli.get_status(format.to_string()).await
     }
     "play" => {
@@ -99,6 +106,9 @@ pub async fn handle_matches(
     "list" => {
       let format = matches.value_of("format").unwrap().to_string();
 
+      // Update the limits for the list and search functions
+      // I think the small and big search limits are very confusing
+      // so I just set them both to max, is this okay?
       if let Some(max) = matches.value_of("limit") {
         cli.update_query_limits(max.to_string()).await?;
       }
@@ -109,6 +119,9 @@ pub async fn handle_matches(
     "search" => {
       let format = matches.value_of("format").unwrap().to_string();
 
+      // Update the limits for the list and search functions
+      // I think the small and big search limits are very confusing
+      // so I just set them both to max, is this okay?
       if let Some(max) = matches.value_of("limit") {
         cli.update_query_limits(max.to_string()).await?;
       }
@@ -124,10 +137,11 @@ pub async fn handle_matches(
           .await,
       )
     }
-    
+    // Clap enforces that one of the things above is specified
     _ => unreachable!(),
   };
 
+  // Check if there was an error
   let api_error = cli.net.app.lock().await.api_error.clone();
   if api_error.is_empty() {
     output

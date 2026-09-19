@@ -1,22 +1,31 @@
 # Filament - Static Fine-grained Rust information flow tool
 
-A fine-grained **Information Flow Control (IFC)** library for Rust. It prevents unauthorized information leaks by tagging every value with a security label, enforcing flow rules at compile time, and supporting runtime-conditional label changes through a dynamic release mechanism.
+A fine-grained **Information Flow Control (IFC)** library for Rust. Sensitive values are wrapped in a
+type carrying a security label; everything else is `Public` by default. Flow rules are enforced
+entirely at compile time, with no run-time representation cost.
 
-### Rust version
-- Set Rustc to <= 1.82 
+Filament is a Denning-style system: it tracks a program counter label so that *implicit* flows
+(through control flow) are checked as well as explicit ones. See `pc_block!` below.
+
 
 ---
 
-## There are two type of labels:
-- Static Label: Labeled
-- Dyanmic Label: DRLabel
+## Requirements
+
+**A nightly Rust toolchain is required.** The library uses
+`#![feature(auto_traits, negative_impls)]` to express the traits that gate what may appear
+inside a `pc_block!`; neither is available on stable. `rust-toolchain.toml` pins the channel,
+so `cargo` picks it up automatically — no manual `+nightly` needed.
 
 ## The Static Security Lattice
 
-The lattice is a partial order over security labels. It answers: *"can information from level X flow to level Y?"*
+Every sensitive value is a `Labeled<T, L>`, where `L` is a label drawn from the lattice below. The
+lattice is a partial order over security labels. It answers: *"can information from level X flow to
+level Y?"*
 
 ### Labels
-Three level lattice
+
+The default lattice is the powerset of `{A, B, C}` ordered by inclusion, plus a top element `T`.
 
 | Label    | Meaning                              |
 |----------|--------------------------------------|
@@ -35,16 +44,27 @@ Three level lattice
 Information may only flow **upward** in the lattice:
 
 ```
-        T
-       /|\
-      AB AC BC
-     /|  |  |\
-    A  B  B  C
-     \ |  | /
-      Public
+          T          top
+          |
+         ABC
+       /  |  \
+     AB   AC   BC     AB = {A,B}   AC = {A,C}   BC = {B,C}
+       \  |  /
+      A   B   C
+       \  |  /
+        Public        bottom
 ```
 
-For example, `A ⊑ AB ⊑ T` — Alice's secret can be raised to a joint secret or top, but never lowered back to `Public`.
+Each joint label sits above both of its components, which the diagram cannot show without
+crossing lines. The covering relations are:
+
+```
+Public ⊑ A, B, C
+A ⊑ AB, AC        B ⊑ AB, BC        C ⊑ AC, BC
+AB, AC, BC ⊑ ABC        ABC ⊑ T
+```
+
+For example, `A ⊑ AB ⊑ ABC ⊑ T` — Alice's secret can be raised to a joint secret or top, but never lowered back to `Public`.
 
 The `LEQ<Target>` trait encodes this: `impl LEQ<AB> for A {}` means `A` can flow to `AB`.
 
@@ -77,49 +97,7 @@ let val: &u32 = secret.declassify_ref();
 let raw: u32 = declassify(secret);
 ```
 
-**Memory erasure**: `Labeled<T, T>` (top label) uses `write_volatile` to zero the value's memory bytes on drop. If the value has already been consumed via `declassify`, the `Drop` impl is a no-op.
-
-**Conversions**:
-```rust
-// Labeled<T, L> → DRLabel<T, S, L, L>  (no dynamic transition)
-let dr = labeled.to_dr_label::<TrueB1>();
-
-// DRLabel<T, S, L, L> → Labeled<T, L>  (resolved label, from == to)
-let back: Labeled<T, L> = dr.to_labeled();
-```
-
----
-
-### `DRLabel<T, S, F1, F2>`
-
-A value whose effective label changes at runtime when a **security event** fires.
-
-| Parameter | Meaning |
-|-----------|---------|
-| `T`       | Wrapped value type |
-| `S`       | Security Event |
-| `F1`      | Label **before** the event fires |
-| `F2`      | Label **after** the event fires |
-
-```rust
-// A credit card number: secret until payment is authorized
-let mut card: DRLabel<String, TrueB1, AB, A> = DRLabel::new("4111-1111".into());
-
-// Fire the release event (payment authorized)
-eventon(&mut card);
-
-// Deactivate if needed
-eventoff(&mut card);
-```
-
-**Event control** modifies a `bool` field (`cond`) inside the label and registers its address in the global `GUARDS` set (event trace in theory). This set is used at runtime to verify that a label's event has actually been fired before allowing a flow.
-
-**Assignment** between `DRLabel`s checks the `DRFlowsTo` trait at compile time:
-```rust
-source.assign_to(&mut target); // compile error if flow is not allowed
-```
-
-**Nesting** is supported: `F1` and `F2` can themselves be `DRLabel<(), S, ...>`, enabling multi-layer conditional release like `S1?((S2?AB→A)→Public)`.
+**Memory erasure**: a value at the top label (`Labeled<V, T>`) uses `write_volatile` to zero the value's memory bytes on drop. If the value has already been consumed via `declassify`, the `Drop` impl is a no-op.
 
 ---
 
@@ -182,9 +160,9 @@ Use `mcall!` for structural transformations that don't introduce new secrets (co
 
 ### `relabel!` — Label Upgrades
 
-`relabel!` changes a value's label, subject to flow checks. It has three forms:
+`relabel!` changes a value's label, subject to a compile-time flow check.
 
-**1. Static upgrade** — move a value to a higher label (compile-time only):
+**Static upgrade** — move a value to a higher label:
 
 ```rust
 let public_val: Labeled<u32, Public> = Labeled::new(5);
@@ -196,19 +174,9 @@ let secret_val: Labeled<u32, A> = relabel!(public_val, A);
 // let bad = relabel!(secret_val, Public);
 ```
 
-**2. Nested DRLabel peel** — strip one layer from a nested dynamic label, with a runtime guard check:
+A raw (unlabeled) value is treated as `Public`, so `relabel!(5, A)` produces a `Labeled<u32, A>`.
 
-```rust
-// 3-arg form: relabel!(expr, &events, IntermediateLabel)
-let resolved = relabel!(nested_dr, &guards, AB);
-```
-
-**3. Dynamic resolve** — convert a `DRLabel<T, S, F1, F2>` to a resolved static-equivalent, via a two-stage flow check and runtime guard check:
-
-```rust
-// 4-arg form: relabel!(expr, &events, IntermediateLabel, TargetLabel)
-let static_like = relabel!(dr_val, &guards, AB, A);
-```
+`relabel!` rejects mutable references: `relabel!(&mut x, A)` is a compile error.
 
 ---
 
@@ -230,27 +198,19 @@ pc_block! {
 }
 ```
 
-Inside a `pc_block!`, every assignment goes through `secure_assign_with_pc`, which enforces two rules simultaneously:
-- **Explicit flow**: source label ⊑ destination label
-- **Implicit flow**: current PC ⊑ destination label
+`pc_block!` follows Cocoon's `secret_block!`: the macro emits the block twice, once to run and once — never executed — carrying the checks, so a program that could leak or cause a side effect does not compile. Inside the block:
 
-Side-effecting operations (like `println!`) inside a non-`Public` PC block are rejected at compile time via the `InvisibleSideEffectFree` trait.
+- **Writes**: every write (`=`, `+=`, `&mut`, `push`, …) must satisfy *current PC ⊑ label of the target*; an unlabeled target counts as `Public`. Labels of values must match exactly (no implicit upgrade). The PC is raised inside `if` / `if let` / `while` / `for` on labeled values, and a value leaving such a branch carries the condition's label.
+- **Calls**: every callee must be `#[side_effect_free_attr]` (whose body is itself checked) or one of a few allowlisted std functions. Calls may not receive `&mut` arguments. As in Cocoon, the attribute makes the function an `unsafe fn` returning `Vetted`, so unchecked code cannot pass off its result: inside a block call it as `f(x)`; elsewhere, `unsafe { f(x) }.unwrap()`.
+- **Methods and operators**: only the std methods in `typing_rules::safe_methods` (`len`, `get`, `push`, `iter`, …) and the std operators in `typing_rules::safe_ops`; application types cannot supply their own.
+- **Values**: every value read must be `InvisibleSideEffectFree` (no custom `Drop` / `Deref`); the block may not mutate unlabeled variables from outside it.
+- **Rejected**: macros, `match`, closures, `return`, `break` / `continue`, `?`, `while let`, `let … else`, and any item other than `const` / `use`. Most report *syntax not supported in `pc_block!`*. Keep blocks small and put the work in `#[side_effect_free_attr]` functions, which accept ordinary Rust.
+- **Panics**: a panic inside a block aborts the process rather than being caught. Because the PC drops back after a branch, resuming after a panic would reveal that the block stopped early — and panic messages can themselves carry secret-derived data, so they are suppressed while a block runs. (Cocoon catches and returns a default, which is sound there because every write in a secret block is at the block's own label.)
 
----
+A generic start label works without extra bounds — `Label` carries the join laws, so
+`fn f<L: Label>()` containing `pc_block!((L) { .. })` needs no `where L: Join<L, Out = L>`.
 
-## Output Functions
-
-For `DRLabel` values, output is gated on whether the event has fired:
-
-```rust
-// Output only if event fired (cond == true)
-output_to(&dr_val, &output_label, &guards);
-
-// Output only if event has NOT fired (cond == false)
-output_from(&dr_val, &output_label, &guards);
-```
-
-Both check the flow rule at compile time via `ReleaseTo` and perform a runtime guard membership check.
+There is no unchecked variant of `pc_block!`. Code that genuinely cannot be checked should `declassify` the values it needs and then be plain Rust, so the trust is visible and counted. The rules are documented in `fg_ifc_library/macros/src/pc_block_expand.rs`, and `fg_ifc_library/pc_block_tests` has one compile-fail test per rejected leak.
 
 ---
 
@@ -289,16 +249,51 @@ fn main() {
 
 | Example | Description |
 |---------|-------------|
-| `toy_examples` | Three small scenarios: a bidding game, a credit card number with conditional release, and a shared library system. Good first read. |
-| `all_function_calls` | Exercises the full `fcall!`/`mcall!`/`relabel!` API surface — math, file I/O, serialization, and string operations. |
-| `calendar` | Two users' calendars labeled `A` and `B`; finds free-slot overlap using `pc_block!` for implicit flow control. Result is labeled `AB`. |
-| `battleship_new` | A full Battleship game demonstrating complex control flow, session types, and IFC across a multi-round game loop. |
-| `dynamic_examples` | Advanced `DRLabel` scenarios: nested release, bidirectional events, and multi-level label resolution. |
+| `all_function_calls` | Exercises the full `fcall!`/`mcall!`/`relabel!` API surface — math, file I/O, serialization, and string operations. Good first read. |
+| `calendar` | Two users' calendars labeled `A` and `B`; counts overlapping availability using `pc_block!`. Result is labeled `AB`. This is the example that exercises `pc_block!`. |
+| `battleship_new` | Two-player Battleship over `session_types`, each player's ship positions labeled. Needs no `pc_block!`, because placement never reads a secret — see its own README. |
 | `jpmail` | Email system with per-recipient label policies enforced through labeled message fields. |
-| `spotify-tui` | The open-source Spotify TUI client, retrofitted with IFC labels on user credentials and playback state. |
+| `spotify-tui` | The Spotify TUI client, retrofitted with IFC on the client secret. **Outside the workspace** — see below. |
+| `*-no-ifc`, `spotify-tui-original` | Unmodified baselines, for comparing against their IFC ports. |
 
+## Building and Running
 
+```bash
+git clone https://github.com/jeffreyccching/filament-ifc.git
+cd filament-ifc
+
+cargo build --workspace
+cargo test  --workspace
+
+# the pc_block! rules: one compile-fail case per rejected leak, plus run-time behaviour
+cargo test -p pc_block_tests
+
+cargo run -p calendar          # prints "Available days: 2"
 ```
+
+`examples/spotify-tui` and `examples/spotify-tui-original` are listed in `workspace.exclude` — they
+pull a large dependency tree and need their own `[patch.crates-io]` for `chrono`, so `--workspace`
+skips them. Build them separately:
+
+```bash
+cd examples/spotify-tui          && cargo build
+cd examples/spotify-tui-original && cargo build
+```
+
+## Trusted operations
+
+Everything below bypasses a check and is the surface to audit; the rest of a program is
+verified by the compiler.
+
+| Operation | What it bypasses |
+|---|---|
+| `declassify(x)`, `declassify_ref(x)` | lowers a label to `Public` |
+| `unchecked_operation(e)` | side-effect checks inside a `pc_block!` |
+| `unsafe` | including calling a `#[side_effect_free_attr]` function directly |
+
+`fcall!` and `mcall!` operate on labeled values outside any `pc_block!`, so the functions they
+call are trusted not to have side effects — they are not verified. Treat them as part of the
+audit surface when reviewing.
 
 ## References
 Andrew C. Myers, Lantian Zheng, Steve Zdancewic, Stephen Chong, and Nathaniel Nystrom. 2006. Jif 3.0: Java information flow. http://www.cs.cornell.edu/jif.

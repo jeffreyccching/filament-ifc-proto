@@ -68,7 +68,7 @@ impl<T> ScrollableResultPages<T> {
 
   pub fn add_pages(&mut self, new_pages: T) {
     self.pages.push(new_pages);
-    
+    // Whenever a new page is added, set the active index to the end of the vector
     self.index = self.pages.len() - 1;
   }
 }
@@ -168,6 +168,7 @@ pub struct Route {
   pub hovered_block: ActiveBlock,
 }
 
+// Is it possible to compose enums?
 #[derive(PartialEq, Debug)]
 pub enum TrackTableContext {
   MyPlaylists,
@@ -178,6 +179,7 @@ pub enum TrackTableContext {
   MadeForYou,
 }
 
+// Is it possible to compose enums?
 #[derive(Clone, PartialEq, Debug, Copy)]
 pub enum AlbumTableContext {
   Simplified,
@@ -267,7 +269,12 @@ pub struct App {
   pub api_error: String,
   pub current_playback_context: Option<CurrentlyPlaybackContext>,
   pub devices: Option<DevicePayload>,
-  
+  // Inputs:
+  // input is the string for input;
+  // input_idx is the index of the cursor in terms of character;
+  // input_cursor_position is the sum of the width of characters preceding the cursor.
+  // Reason for this complication is due to non-ASCII characters, they may
+  // take more than 1 bytes to store and more than 1 character width to display.
   pub input: Vec<char>,
   pub input_idx: usize,
   pub input_cursor_position: u16,
@@ -422,14 +429,15 @@ impl App {
     }
   }
 
+  // Send a network event to the network thread
   pub fn dispatch(&mut self, action: IoEvent) {
-    
+    // `is_loading` will be set to false again after the async action has finished in network.rs
     self.is_loading = true;
     if let Some(io_tx) = &self.io_tx {
       if let Err(e) = io_tx.send(action) {
         self.is_loading = false;
         println!("Error from dispatch {}", e);
-        
+        // TODO: handle error
       };
     }
   }
@@ -455,7 +463,7 @@ impl App {
   }
 
   fn poll_current_playback(&mut self) {
-    
+    // Poll every 5 seconds
     let poll_interval_ms = 5_000;
 
     let elapsed = self
@@ -465,7 +473,7 @@ impl App {
 
     if !self.is_fetching_current_playback && elapsed >= poll_interval_ms {
       self.is_fetching_current_playback = true;
-      
+      // Trigger the seek if the user has set a new position
       match self.seek_ms {
         Some(seek_ms) => self.apply_seek(seek_ms as u32),
         None => self.dispatch(IoEvent::GetCurrentPlayback),
@@ -482,7 +490,8 @@ impl App {
       ..
     }) = &self.current_playback_context
     {
-      
+      // Update progress even when the song is not playing,
+      // because seeking is possible while paused
       let elapsed = if *is_playing {
         self
           .instant_since_last_current_playback_poll
@@ -602,7 +611,7 @@ impl App {
     {
       self.dispatch(IoEvent::PausePlayback);
     } else {
-      
+      // When no offset or uris are passed, spotify will resume current playback
       self.dispatch(IoEvent::StartPlayback(None, None, None));
     }
   }
@@ -615,6 +624,8 @@ impl App {
     }
   }
 
+  // The navigation_stack actually only controls the large block to the right of `library` and
+  // `playlists`
   pub fn push_navigation_stack(&mut self, next_route_id: RouteId, next_active_block: ActiveBlock) {
     if !self
       .navigation_stack
@@ -639,7 +650,7 @@ impl App {
   }
 
   pub fn get_current_route(&self) -> &Route {
-    
+    // if for some reason there is no route return the default
     self.navigation_stack.last().unwrap_or(&DEFAULT_ROUTE)
   }
 
@@ -776,7 +787,7 @@ impl App {
   }
 
   pub fn get_current_user_saved_tracks_next(&mut self) {
-    
+    // Before fetching the next tracks, check if we have already fetched them
     match self
       .library
       .saved_tracks
@@ -1100,7 +1111,7 @@ impl App {
   }
 
   pub fn get_made_for_you(&mut self) {
-    
+    // TODO: replace searches when relevant endpoint is added
     const DISCOVER_WEEKLY: &str = "Discover Weekly";
     const RELEASE_RADAR: &str = "Release Radar";
     const ON_REPEAT: &str = "On Repeat";
@@ -1108,7 +1119,8 @@ impl App {
     const DAILY_DRIVE: &str = "Daily Drive";
 
     if self.library.made_for_you_playlists.pages.is_empty() {
-      
+      // We shouldn't be fetching all the results immediately - only load the data when the
+      // user selects the playlist
       self.made_for_you_search_and_add(DISCOVER_WEEKLY);
       self.made_for_you_search_and_add(RELEASE_RADAR);
       self.made_for_you_search_and_add(ON_REPEAT);
@@ -1139,7 +1151,8 @@ impl App {
           }
         }
         PlayingItem::Episode(_episode) => {
-          
+          // No audio analysis available for podcast uris, so just default to the empty analysis
+          // view to avoid a 400 error code
           self.push_navigation_stack(RouteId::Analysis, ActiveBlock::Analysis);
         }
       }

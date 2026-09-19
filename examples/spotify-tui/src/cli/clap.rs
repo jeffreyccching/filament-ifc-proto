@@ -213,7 +213,7 @@ The same function as found in `playback` will be called.",
       Arg::with_name("queue")
         .short("q")
         .long("queue")
-        
+        // Only works with tracks
         .conflicts_with_all(&["album", "artist", "playlist", "show"])
         .help("Adds track to queue instead of playing it directly"),
     )
@@ -221,7 +221,7 @@ The same function as found in `playback` will be called.",
       Arg::with_name("random")
         .short("r")
         .long("random")
-        
+        // Only works with playlists
         .conflicts_with_all(&["track", "album", "artist", "show"])
         .help("Plays a random track (only works with playlists)"),
     )

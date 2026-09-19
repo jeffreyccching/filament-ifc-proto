@@ -1,4 +1,3 @@
-use crate::dynamic_release::DRLabel;
 use crate::lattice::*;
 use std::marker::PhantomData;
 
@@ -6,7 +5,6 @@ use std::marker::PhantomData;
 //  SecureChainCombine: determines the output type of a chain step.
 //
 //  Both Labeled → join labels: Output = Labeled<R, OuterL Join L2>.
-//  One Labeled + one DRLabel → pass DRLabel through: Output = DRLabel<R, S, F1, F2>.
 // =========================================================================
 #[doc(hidden)]
 pub trait SecureChainCombine<OuterL: Label> {
@@ -25,11 +23,6 @@ where
     }
 }
 
-impl<T, S, F1, F2, OuterL: Label> SecureChainCombine<OuterL> for DRLabel<T, S, F1, F2> {
-    type Output = DRLabel<T, S, F1, F2>;
-    fn combine(self) -> Self::Output { self }
-}
-
 impl<T, L: Label> Labeled<T, L> {
     #[doc(hidden)]
     pub fn __chain<Ret, F>(mut self, f: F) -> <Ret as SecureChainCombine<L>>::Output
@@ -37,7 +30,9 @@ impl<T, L: Label> Labeled<T, L> {
         Ret: SecureChainCombine<L>,
         F: FnOnce(T) -> Ret,
     {
-        f(self.value.take().unwrap()).combine()
+        let __r = f(self.value.take().unwrap()).combine();
+        <L as crate::stack_scrub::ScrubPolicy>::scrub();
+        __r
     }
 
     /// Like `__chain` but borrows `self`, giving the closure `&T`.
@@ -48,7 +43,22 @@ impl<T, L: Label> Labeled<T, L> {
         Ret: SecureChainCombine<L>,
         F: FnOnce(&'a T) -> Ret,
     {
-        f(self.value.as_ref().unwrap()).combine()
+        let __r = f(self.value.as_ref().unwrap()).combine();
+        <L as crate::stack_scrub::ScrubPolicy>::scrub();
+        __r
+    }
+
+    /// Mutable-ref chain. Used by `fcall!` for `&mut expr` arguments so the
+    /// closure can mutate the inner value while the label `L` propagates.
+    #[doc(hidden)]
+    pub fn __chain_mut_ref<'a, Ret, F>(&'a mut self, f: F) -> <Ret as SecureChainCombine<L>>::Output
+    where
+        Ret: SecureChainCombine<L>,
+        F: FnOnce(&'a mut T) -> Ret,
+    {
+        let __r = f(self.value.as_mut().unwrap()).combine();
+        <L as crate::stack_scrub::ScrubPolicy>::scrub();
+        __r
     }
 }
 
@@ -107,44 +117,73 @@ where
 }
 
 // =========================================================================
-//  SecureMethodCall: trait-based mcall! dispatch for Labeled and DRLabel.
-//
-//  Labeled<T, L>        → __mcall returns Labeled<U, L>   (label preserved)
-//  DRLabel<T, S, F1, F2> → __mcall returns DRLabel<U, S, F1, F2> (event preserved)
+//  CHAIN_MUT_REF TRAIT: FOR PLAIN (non-Labeled) MUTABLE REFERENCE ARGUMENTS
 // =========================================================================
+// Mirrors `SecureChainRef` for `&mut x` plain values (treats them as Public).
 #[doc(hidden)]
-pub trait SecureMethodCall {
-    type Inner;
-    type Wrapped<U>;
-    fn __mcall<U, F>(&self, f: F) -> Self::Wrapped<U>
+pub trait SecureChainMutRef<T, L: Label> {
+    fn __chain_mut_ref<Ret, F>(&mut self, f: F) -> <Ret as SecureChainCombine<L>>::Output
     where
-        F: FnOnce(&Self::Inner) -> U;
+        Ret: SecureChainCombine<L>,
+        F: FnOnce(&mut T) -> Ret;
 }
 
-impl<T, L: Label> SecureMethodCall for Labeled<T, L> {
-    type Inner = T;
-    type Wrapped<U> = Labeled<U, L>;
-    fn __mcall<U, F>(&self, f: F) -> Labeled<U, L>
+impl<T> SecureChainMutRef<T, Public> for T
+where
+    T: Sized,
+{
+    fn __chain_mut_ref<Ret, F>(&mut self, f: F) -> <Ret as SecureChainCombine<Public>>::Output
     where
-        F: FnOnce(&T) -> U,
+        Ret: SecureChainCombine<Public>,
+        F: FnOnce(&mut T) -> Ret,
     {
-        Labeled { value: Some(f(self.value.as_ref().unwrap())), _marker: PhantomData }
+        f(self).combine()
     }
 }
 
-impl<T, S, F1, F2> SecureMethodCall for DRLabel<T, S, F1, F2> {
-    type Inner = T;
-    type Wrapped<U> = DRLabel<U, S, F1, F2>;
-    fn __mcall<U, F>(&self, f: F) -> DRLabel<U, S, F1, F2>
+// =========================================================================
+//  __mcall — inherent methods on Labeled (not a trait).
+//
+//  The `mcall!` macro emits `(receiver).__mcall(|inner| ...)`; method
+//  resolution finds the inherent method on the receiver type.
+//  The `SecureMethodCall` trait is kept (empty marker — same name) so the
+//  macro's `use SecureMethodCall as __SecureMethodCall;` import doesn't
+//  break, but it's not needed for dispatch any more.
+//
+//  Labeled<T, L> → __mcall returns Labeled<U, L> (label preserved)
+// =========================================================================
+#[doc(hidden)]
+pub trait SecureMethodCall {}  // no-op marker, kept for macro `use ... as` compat
+impl<T, L: Label> SecureMethodCall for Labeled<T, L> {}
+
+impl<T, L: Label> Labeled<T, L> {
+    /// `&self` form. Closure receives `&T`. The `mcall!` macro emits the
+    /// `__mcall_mut` form below by default; this is kept for shared-only
+    /// call sites (e.g. `mcall!(msg.body.len())` where `msg: &Foo` so a
+    /// `&mut` borrow isn't possible). Bypass the macro and call this method
+    /// directly when that situation arises.
+    #[doc(hidden)]
+    pub fn __mcall<U, F>(&self, f: F) -> Labeled<U, L>
     where
         F: FnOnce(&T) -> U,
     {
-        DRLabel {
-            value: f(&self.value),
-            cond: self.cond,
-            s_event: PhantomData,
-            dynamic_label: PhantomData,
-        }
+        let __r = Labeled { value: Some(f(self.value.as_ref().unwrap())), _marker: PhantomData };
+        <L as crate::stack_scrub::ScrubPolicy>::scrub();
+        __r
+    }
+
+    /// `&mut self` form. Closure receives `&mut T`. The `mcall!` macro emits
+    /// `(&mut $receiver).__mcall_mut(...)` so both `&self` stdlib methods
+    /// (auto-deref `&mut T → &T`) and `&mut self` stdlib methods compile in
+    /// the closure body.
+    #[doc(hidden)]
+    pub fn __mcall_mut<U, F>(&mut self, f: F) -> Labeled<U, L>
+    where
+        F: FnOnce(&mut T) -> U,
+    {
+        let __r = Labeled { value: Some(f(self.value.as_mut().unwrap())), _marker: PhantomData };
+        <L as crate::stack_scrub::ScrubPolicy>::scrub();
+        __r
     }
 }
 
@@ -177,10 +216,12 @@ where
         let val = self.value.take().unwrap();
         Box::pin(async move {
             let mut inner_res = f(val).await;
-            Labeled {
+            let __r = Labeled {
                 value: inner_res.value.take(),
                 _marker: PhantomData,
-            }
+            };
+            <L as crate::stack_scrub::ScrubPolicy>::scrub();
+            __r
         })
     }
 }

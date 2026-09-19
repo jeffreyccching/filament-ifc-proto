@@ -9,6 +9,7 @@ use rspotify::{
 
 use crate::user_config::UserConfig;
 
+// Possible types to list or search
 #[derive(Debug)]
 pub enum Type {
   Playlist,
@@ -33,7 +34,7 @@ impl Type {
     } else if m.is_present("show") {
       Self::Show
     }
-    
+    // Enforced by clap
     else {
       unreachable!()
     }
@@ -51,7 +52,7 @@ impl Type {
     } else if m.is_present("shows") {
       Self::Show
     }
-    
+    // Enforced by clap
     else {
       unreachable!()
     }
@@ -65,15 +66,21 @@ impl Type {
     } else if m.is_present("liked") {
       Self::Liked
     }
-    
+    // Enforced by clap
     else {
       unreachable!()
     }
   }
 }
 
+//
+// Possible flags to set
+//
+
 pub enum Flag {
-  
+  // Does not get toggled
+  // * User chooses like -> Flag::Like(true)
+  // * User chooses dislike -> Flag::Like(false)
   Like(bool),
   Shuffle,
   Repeat,
@@ -81,9 +88,10 @@ pub enum Flag {
 
 impl Flag {
   pub fn from_matches(m: &ArgMatches<'_>) -> Vec<Self> {
-    
+    // Multiple flags are possible
     let mut flags = Vec::new();
 
+    // Only one of these two
     if m.is_present("like") {
       flags.push(Self::Like(true));
     } else if m.is_present("dislike") {
@@ -100,6 +108,7 @@ impl Flag {
   }
 }
 
+// Possible directions to jump to
 pub enum JumpDirection {
   Next,
   Previous,
@@ -111,13 +120,18 @@ impl JumpDirection {
       (Self::Next, m.occurrences_of("next"))
     } else if m.is_present("previous") {
       (Self::Previous, m.occurrences_of("previous"))
-    
+    // Enforced by clap
     } else {
       unreachable!()
     }
   }
 }
 
+// For fomatting (-f / --format flag)
+
+// Types to create a Format enum from
+// Boxing was proposed by cargo clippy
+// to reduce the size of this enum
 pub enum FormatType {
   Album(Box<SimplifiedAlbum>),
   Artist(Box<FullArtist>),
@@ -127,6 +141,7 @@ pub enum FormatType {
   Show(Box<SimplifiedShow>),
 }
 
+// Types that can be formatted
 #[derive(Clone)]
 pub enum Format {
   Album(String),
@@ -137,9 +152,9 @@ pub enum Format {
   Uri(String),
   Device(String),
   Volume(u32),
-  
+  // Current position, duration
   Position((u32, u32)),
-  
+  // This is a bit long, should it be splitted up?
   Flags((RepeatState, bool, bool)),
   Playing(bool),
 }
@@ -152,7 +167,7 @@ pub fn join_artists(a: Vec<SimplifiedArtist>) -> String {
 }
 
 impl Format {
-  
+  // Extract important information from types
   pub fn from_type(t: FormatType) -> Vec<Self> {
     match t {
       FormatType::Album(a) => {
@@ -188,6 +203,7 @@ impl Format {
     }
   }
 
+  // Is there a better way?
   pub fn inner(&self, conf: UserConfig) -> String {
     match self {
       Self::Album(s) => s.clone(),
@@ -197,7 +213,8 @@ impl Format {
       Self::Show(s) => s.clone(),
       Self::Uri(s) => s.clone(),
       Self::Device(s) => s.clone(),
-      
+      // Because this match statements
+      // needs to return a &String, I have to do it this way
       Self::Volume(s) => s.to_string(),
       Self::Position((curr, duration)) => {
         crate::ui::util::display_track_progress(*curr as u128, *duration)
@@ -219,10 +236,11 @@ impl Format {
           RepeatState::Context => conf.behavior.repeat_context_icon,
         };
 
+        // Add them together (only those that aren't empty)
         [shuffle, repeat, like]
           .iter()
           .filter(|a| !a.is_empty())
-          
+          // Convert &String to String to join them
           .map(|s| s.to_string())
           .collect::<Vec<String>>()
           .join(" ")

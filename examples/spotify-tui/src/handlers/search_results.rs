@@ -9,7 +9,7 @@ use crate::event::Key;
 use crate::network::IoEvent;
 
 fn handle_down_press_on_selected_block(app: &mut App) {
-  
+  // Start selecting within the selected block
   match app.search_results.selected_block {
     SearchResultBlock::AlbumSearch => {
       if let Some(result) = &app.search_results.albums {
@@ -82,7 +82,7 @@ fn handle_down_press_on_hovered_block(app: &mut App) {
 }
 
 fn handle_up_press_on_selected_block(app: &mut App) {
-  
+  // Start selecting within the selected block
   match app.search_results.selected_block {
     SearchResultBlock::AlbumSearch => {
       if let Some(result) = &app.search_results.albums {
@@ -324,7 +324,7 @@ fn handle_enter_event_on_selected_block(app: &mut App) {
         &app.search_results.playlists,
       ) {
         if let Some(playlist) = playlists_result.items.get(index) {
-          
+          // Go to playlist tracks table
           app.track_table.context = Some(TrackTableContext::PlaylistSearch);
           let playlist_id = playlist.id.to_owned();
           app.dispatch(IoEvent::GetPlaylistTracks(playlist_id, app.playlist_offset));
@@ -337,7 +337,7 @@ fn handle_enter_event_on_selected_block(app: &mut App) {
         &app.search_results.shows,
       ) {
         if let Some(show) = shows_result.items.get(index).cloned() {
-          
+          // Go to show tracks table
           app.dispatch(IoEvent::GetShowEpisodes(Box::new(show)));
         };
       }
@@ -491,7 +491,7 @@ pub fn handler(key: Key, app: &mut App) {
         handle_low_press_on_selected_block(app)
       }
     }
-    
+    // Handle pressing enter when block is selected to start playing track
     Key::Enter => match app.search_results.selected_block {
       SearchResultBlock::Empty => handle_enter_event_on_hovered_block(app),
       SearchResultBlock::PlaylistSearch => {
@@ -538,7 +538,7 @@ pub fn handler(key: Key, app: &mut App) {
     },
     Key::Char('r') => handle_recommended_tracks(app),
     _ if key == app.user_config.keys.add_item_to_queue => handle_add_item_to_queue(app),
-    
+    // Add `s` to "see more" on each option
     _ => {}
   }
 }

@@ -44,9 +44,9 @@ pub fn handler(key: Key, app: &mut App) {
     Key::Enter => {
       on_enter(app);
     }
-    
+    // Scroll down
     k if k == app.user_config.keys.next_page => handle_next_event(app),
-    
+    // Scroll up
     k if k == app.user_config.keys.previous_page => handle_prev_event(app),
     Key::Char('S') => toggle_sort_by_date(app),
     Key::Char('s') => handle_follow_event(app),
@@ -113,7 +113,7 @@ fn jump_to_start(app: &mut App) {
 }
 
 fn toggle_sort_by_date(app: &mut App) {
-  
+  //TODO: reverse whole list and not just currently visible episodes
   let selected_id = match app.library.show_episodes.get_results(None) {
     Some(episodes) => episodes
       .items

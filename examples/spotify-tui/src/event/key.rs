@@ -1,61 +1,65 @@
 use crossterm::event;
 use std::fmt;
 
+/// Represents an key.
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub enum Key {
-  
+  /// Both Enter (or Return) and numpad Enter
   Enter,
-  
+  /// Tabulation key
   Tab,
-  
+  /// Backspace key
   Backspace,
-  
+  /// Escape key
   Esc,
 
+  /// Left arrow
   Left,
-  
+  /// Right arrow
   Right,
-  
+  /// Up arrow
   Up,
-  
+  /// Down arrow
   Down,
 
+  /// Insert key
   Ins,
-  
+  /// Delete key
   Delete,
-  
+  /// Home key
   Home,
-  
+  /// End key
   End,
-  
+  /// Page Up key
   PageUp,
-  
+  /// Page Down key
   PageDown,
 
+  /// F0 key
   F0,
-  
+  /// F1 key
   F1,
-  
+  /// F2 key
   F2,
-  
+  /// F3 key
   F3,
-  
+  /// F4 key
   F4,
-  
+  /// F5 key
   F5,
-  
+  /// F6 key
   F6,
-  
+  /// F7 key
   F7,
-  
+  /// F8 key
   F8,
-  
+  /// F9 key
   F9,
-  
+  /// F10 key
   F10,
-  
+  /// F11 key
   F11,
-  
+  /// F12 key
   F12,
   Char(char),
   Ctrl(char),
@@ -64,7 +68,13 @@ pub enum Key {
 }
 
 impl Key {
-  
+  /// Returns the function key corresponding to the given number
+  ///
+  /// 1 -> F1, etc...
+  ///
+  /// # Panics
+  ///
+  /// If `n == 0 || n > 12`
   pub fn from_f(n: u8) -> Key {
     match n {
       0 => Key::F0,
@@ -174,6 +184,7 @@ impl From<event::KeyEvent> for Key {
         ..
       } => Key::Tab,
 
+      // First check for char + modifier
       event::KeyEvent {
         code: event::KeyCode::Char(c),
         modifiers: event::KeyModifiers::ALT,

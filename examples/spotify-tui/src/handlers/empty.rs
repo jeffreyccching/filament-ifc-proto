@@ -4,6 +4,7 @@ use crate::{
   event::Key,
 };
 
+// When no block is actively selected, just handle regular event
 pub fn handler(key: Key, app: &mut App) {
   match key {
     Key::Enter => {
@@ -88,6 +89,7 @@ mod tests {
     assert_eq!(current_route.active_block, ActiveBlock::Empty);
     assert_eq!(current_route.hovered_block, ActiveBlock::MyPlaylists);
 
+    // TODO: test the other cases when they are implemented
   }
 
   #[test]

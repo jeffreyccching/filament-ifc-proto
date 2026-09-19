@@ -4,7 +4,7 @@ use macros::*;
 use serde::{Deserialize, Serialize};
 use std::{
   fs,
-  io::{stdin, Write},
+  io::stdin,
   path::{Path, PathBuf},
 };
 use typing_rules::*;
@@ -17,6 +17,8 @@ const CONFIG_DIR: &str = ".config";
 const APP_CONFIG_DIR: &str = "spotify-tui";
 const TOKEN_CACHE_FILE: &str = ".spotify_token_cache.json";
 
+// Plain struct used only at the serde boundary (serialize/deserialize).
+// No Labeled fields — Labeled<T,L> no longer implements Serialize/Deserialize.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClientConfigSerde {
   client_id: String,
@@ -100,14 +102,14 @@ impl ClientConfig {
   pub fn set_device_id(&mut self, device_id: String) -> Result<()> {
     let paths = self.get_or_build_paths()?;
     let config_file = SecureFile::<A>::open(paths.config_file_path);
-    let config_string = mcall!(config_file.read_to_string()?);
+    let config_string = config_file.read_to_string()?;
     let mut config_plain = fcall!(serde_yaml::from_str::<ClientConfigSerde>(&config_string)?);
 
     self.device_id = Some(device_id.clone());
     config_plain = mcall!(config_plain.with_device_id(device_id));
 
     let new_config = fcall!(serde_yaml::to_string(&config_plain)?);
-    mcall!(config_file.write(&new_config)?);
+    config_file.write(&new_config)?;
 
     Ok(())
   }
@@ -117,9 +119,9 @@ impl ClientConfig {
 
     if paths.config_file_path.exists() {
       let config_file = SecureFile::<A>::open(paths.config_file_path);
-      let config_string = mcall!(config_file.read_to_string()?);
+      let config_string = config_file.read_to_string()?;
       let start = std::time::Instant::now();
-      let config_plain = fcall!(serde_yaml::from_str::<ClientConfigSerde>(&config_string)?);
+      let mut config_plain = fcall!(serde_yaml::from_str::<ClientConfigSerde>(&config_string)?);
 
       self.client_secret = mcall!(config_plain.client_secret_cloned());
       let cfg: ClientConfigSerde = declassify(config_plain);
@@ -162,7 +164,7 @@ impl ClientConfig {
       stdin().read_line(&mut port)?;
       let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
 
-      let config_plain = relabel!(
+      let mut config_plain = relabel!(
         ClientConfigSerde {
           client_id,
           client_secret: declassify(client_secret),
@@ -173,7 +175,7 @@ impl ClientConfig {
       );
       let content_yml = fcall!(serde_yaml::to_string(&config_plain)?);
       let config_file = SecureFile::<A>::open(paths.config_file_path);
-      mcall!(config_file.write(&content_yml)?);
+      config_file.write(&content_yml)?;
 
       self.client_secret = mcall!(config_plain.client_secret_cloned());
       let cfg: ClientConfigSerde = declassify(config_plain);
@@ -194,8 +196,8 @@ impl ClientConfig {
       println!("\nEnter your {}: ", type_label);
       stdin().read_line(&mut raw_key)?;
       raw_key = raw_key.trim().to_string();
-      let client_key = Labeled::<String, A>::new(raw_key.clone());
-      match ClientConfig::validate_client_key(&client_key).declassify_ref() {
+      let mut client_key = Labeled::<String, A>::new(raw_key.clone());
+      match ClientConfig::validate_client_key(&mut client_key).declassify_ref() {
         Ok(_) => return Ok(client_key),
         Err(error_string) => {
           println!("{}", error_string);
@@ -212,21 +214,25 @@ impl ClientConfig {
     }
   }
 
-  pub fn validate_client_key(key: &Labeled<String, A>) -> Labeled<Result<()>, A> {
+  /// The error carried out of the block is a `&'static str`, not an
+  /// `anyhow::Error`: `anyhow::Error` is a boxed erased type with a custom
+  /// `Drop`, so it is not `InvisibleSideEffectFree` and cannot be written
+  /// inside a `pc_block!`. This mirrors Cocoon's Fig. 10, where the secret
+  /// block yields an error *message* (a `String`) and the caller builds the real error
+  /// value outside the block.
+  /// `key` is a `mut` binding of a `&mut` because `mcall!` emits
+  /// `(&mut key).__mcall_mut(..)`, which needs a mutable borrow of the binding
+  /// even for read-only methods such as `len()`. Nothing here mutates the key.
+  pub fn validate_client_key(mut key: &mut Labeled<String, A>) -> Labeled<Result<(), String>, A> {
     const EXPECTED_LEN: usize = 32;
     let len = mcall!(key.len());
     let is_all_hex = mcall!(key.chars().all(|c| c.is_ascii_hexdigit()));
-    let len_err: Labeled<Result<()>, A> = Labeled::new(Err(Error::from(std::io::Error::new(
-      std::io::ErrorKind::InvalidInput,
-      "invalid length (must be 32 hex digits)",
-    ))));
-    let hex_err: Labeled<Result<()>, A> = Labeled::new(Err(Error::from(std::io::Error::new(
-      std::io::ErrorKind::InvalidInput,
-      "invalid character found (must be hex digits)",
-    ))));
-    let mut result: Labeled<Result<()>, A> = Labeled::new(Ok(()));
+    let len_err: Labeled<Result<(), String>, A> =
+      Labeled::new(Err(String::from("invalid length (must be 32 hex digits)")));
+    let hex_err: Labeled<Result<(), String>, A> =
+      Labeled::new(Err(String::from("invalid character found (must be hex digits)")));
+    let mut result: Labeled<Result<(), String>, A> = Labeled::new(Ok(()));
     pc_block! { (A) {
-      
       if len != EXPECTED_LEN {
         result = len_err;
       }

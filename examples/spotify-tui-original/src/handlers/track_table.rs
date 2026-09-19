@@ -39,7 +39,7 @@ pub fn handler(key: Key, app: &mut App) {
     Key::Enter => {
       on_enter(app);
     }
-    
+    // Scroll down
     k if k == app.user_config.keys.next_page => {
       match &app.track_table.context {
         Some(context) => match context {
@@ -92,7 +92,7 @@ pub fn handler(key: Key, app: &mut App) {
         None => {}
       };
     }
-    
+    // Scroll up
     k if k == app.user_config.keys.previous_page => {
       match &app.track_table.context {
         Some(context) => match context {
@@ -145,7 +145,7 @@ pub fn handler(key: Key, app: &mut App) {
     Key::Char('S') => play_random_song(app),
     k if k == app.user_config.keys.jump_to_end => jump_to_end(app),
     k if k == app.user_config.keys.jump_to_start => jump_to_start(app),
-    
+    //recommended song radio
     Key::Char('r') => {
       handle_recommended_tracks(app);
     }

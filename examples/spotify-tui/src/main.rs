@@ -28,7 +28,7 @@ use crossterm::{
   },
   ExecutableCommand,
 };
-use macros::{fcall, mcall, pc_block, relabel};
+use macros::fcall;
 use network::{get_spotify, IoEvent, Network};
 use redirect_uri::redirect_uri_web_server;
 use rspotify::{
@@ -49,7 +49,7 @@ use tui::{
   backend::{Backend, CrosstermBackend},
   Terminal,
 };
-use typing_rules::lattice::{Label, Labeled, Public, A, LEQ};
+use typing_rules::lattice::{Label, Labeled, A, LEQ};
 use user_config::{UserConfig, UserConfigPaths};
 
 const SCOPES: [&str; 14] = [
@@ -69,6 +69,8 @@ const SCOPES: [&str; 14] = [
   "user-read-recently-played",
 ];
 
+/// Safe output port for Spotify OAuth token retrieval.
+/// Enforces at compile time that the data label `Src` flows to port label `A`.
 async fn safe_get_token_auto<Src: Label + LEQ<A>>(
   oauth: &mut Labeled<SpotifyOAuth, Src>,
   port: u16,
@@ -76,6 +78,7 @@ async fn safe_get_token_auto<Src: Label + LEQ<A>>(
   get_token_auto(oauth.declassify_ref_mut(), port).await
 }
 
+/// get token automatically with local webserver
 pub async fn get_token_auto(spotify_oauth: &mut SpotifyOAuth, port: u16) -> Option<TokenInfo> {
   match spotify_oauth.get_cached_token().await {
     Some(token_info) => Some(token_info),
@@ -104,7 +107,7 @@ fn build_oauth(
 ) -> SpotifyOAuth {
   SpotifyOAuth::default()
     .client_id(&client_id)
-    .client_secret(secret) 
+    .client_secret(secret) // &String passed directly — no declassify
     .redirect_uri(&redirect_uri)
     .cache_path(cache_path)
     .scope(&scope)
@@ -188,7 +191,7 @@ of the app. Beware that this comes at a CPU cost!",
         .possible_values(&["bash", "zsh", "fish", "power-shell", "elvish"])
         .value_name("SHELL"),
     )
-    
+    // Control spotify from the command line
     .subcommand(cli::playback_subcommand())
     .subcommand(cli::play_subcommand())
     .subcommand(cli::list_subcommand())
@@ -196,6 +199,7 @@ of the app. Beware that this comes at a CPU cost!",
 
   let matches = clap_app.clone().get_matches();
 
+  // Shell completions don't need any spotify work
   if let Some(s) = matches.value_of("completions") {
     let shell = match s {
       "fish" => Shell::Fish,
@@ -229,10 +233,12 @@ of the app. Beware that this comes at a CPU cost!",
   }
 
   let mut client_config = ClientConfig::new();
-  
+  //let start = Instant::now();
+  //let mut unused = 0u32;
+  //let start = unsafe { core::arch::x86_64::_rdtscp(&mut unused)};
   let start = client_config.load_config()?;
   let duration = start.elapsed().as_nanos();
-  
+  //let duration = unsafe { core::arch::x86_64::_rdtscp(&mut unused) } - old;
   let mut file = OpenOptions::new()
     .create(true)
     .write(true)
@@ -240,7 +246,7 @@ of the app. Beware that this comes at a CPU cost!",
     .open("modified_results.txt")?;
   write!(file, "{:?}\n", duration)?;
   if duration > 0 {
-    
+    // should be 0 but compiler won't know
     std::process::exit(0);
   }
 
@@ -249,7 +255,7 @@ of the app. Beware that this comes at a CPU cost!",
   let client_id = client_config.client_id.clone();
   let redirect_uri = client_config.get_redirect_uri();
   let config_port = client_config.get_port();
-  
+  // let secret = client_config.client_secret.declassify_ref().clone();
   let mut oauth = fcall!(build_oauth(
     &client_config.client_secret,
     client_id,
@@ -264,28 +270,30 @@ of the app. Beware that this comes at a CPU cost!",
 
       let (spotify, token_expiry) = get_spotify(token_info);
 
+      // Initialise app state
       let app = Arc::new(Mutex::new(App::new(
         sync_io_tx,
         user_config.clone(),
         token_expiry,
       )));
 
+      // Work with the cli (not really async)
       if let Some(cmd) = matches.subcommand_name() {
-        
+        // Save, because we checked if the subcommand is present at runtime
         let m = matches.subcommand_matches(cmd).unwrap();
         let network = Network::new(oauth, spotify, client_config, &app);
         println!(
           "{}",
           cli::handle_matches(m, cmd.to_string(), network, user_config).await?
         );
-      
+      // Launch the UI (async)
       } else {
         let cloned_app = Arc::clone(&app);
         std::thread::spawn(move || {
           let mut network = Network::new(oauth, spotify, client_config, &app);
           start_tokio(sync_io_rx, &mut network);
         });
-        
+        // The UI must run in the "main" thread
         start_ui(user_config, &cloned_app).await?;
       }
     }
@@ -303,7 +311,7 @@ async fn start_tokio<'a>(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mu
 }
 
 async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> {
-  
+  // Terminal initialization
   let mut stdout = stdout();
   execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
   enable_raw_mode()?;
@@ -319,13 +327,15 @@ async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> 
 
   let events = event::Events::new(user_config.behavior.tick_rate_milliseconds);
 
+  // play music on, if not send them to the device selection view
+
   let mut is_first_render = true;
 
   loop {
     let mut app = app.lock().await;
-    
+    // Get the size of the screen on each loop to account for resize event
     if let Ok(size) = terminal.backend().size() {
-      
+      // Reset the help menu is the terminal was resized
       if is_first_render || app.size != size {
         app.help_menu_max_lines = 0;
         app.help_menu_offset = 0;
@@ -333,6 +343,7 @@ async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> 
 
         app.size = size;
 
+        // Based on the size of the terminal, adjust the search limit.
         let potential_limit = max((app.size.height as i32) - 13, 0) as u32;
         let max_limit = min(potential_limit, 50);
         let large_search_limit = min((f32::from(size.height) / 1.4) as u32, max_limit);
@@ -343,6 +354,8 @@ async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> 
           small_search_limit,
         ));
 
+        // Based on the size of the terminal, adjust how many lines are
+        // displayed in the help menu
         if app.size.height > 8 {
           app.help_menu_max_lines = (app.size.height as u32) - 8;
         } else {
@@ -385,11 +398,13 @@ async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> 
       1
     };
 
+    // Put the cursor back inside the input box
     terminal.backend_mut().execute(MoveTo(
       cursor_offset + app.input_cursor_position,
       cursor_offset,
     ))?;
 
+    // Handle authentication refresh
     if SystemTime::now() > app.spotify_token_expiry {
       app.dispatch(IoEvent::RefreshAuthentication);
     }
@@ -402,18 +417,21 @@ async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> 
 
         let current_active_block = app.get_current_route().active_block;
 
+        // To avoid swallowing the global key presses `q` and `-` make a special
+        // case for the input handler
         if current_active_block == ActiveBlock::Input {
           handlers::input_handler(key, &mut app);
         } else if key == app.user_config.keys.back {
           if app.get_current_route().active_block != ActiveBlock::Input {
-            
+            // Go back through navigation stack when not in search input mode and exit the app if there are no more places to back to
+
             let pop_result = match app.pop_navigation_stack() {
               Some(ref x) if x.id == RouteId::Search => app.pop_navigation_stack(),
               Some(x) => Some(x),
               None => None,
             };
             if pop_result.is_none() {
-              break; 
+              break; // Exit application
             }
           }
         } else {
@@ -425,6 +443,8 @@ async fn start_ui(user_config: UserConfig, app: &Arc<Mutex<App>>) -> Result<()> 
       }
     }
 
+    // Delay spotify request until first render, will have the effect of improving
+    // startup speed
     if is_first_render {
       app.dispatch(IoEvent::GetPlaylists);
       app.dispatch(IoEvent::GetUser);

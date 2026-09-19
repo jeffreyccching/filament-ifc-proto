@@ -33,10 +33,11 @@ pub fn redirect_uri_web_server(spotify_oauth: &mut SpotifyOAuth, port: u16) -> R
 }
 
 fn handle_connection(mut stream: TcpStream) -> Option<String> {
-  
+  // The request will be quite large (> 512) so just assign plenty just in case
   let mut buffer = [0; 1000];
   let _ = stream.read(&mut buffer).unwrap();
 
+  // convert buffer into string and 'parse' the URL
   match String::from_utf8(buffer.to_vec()) {
     Ok(request) => {
       let split: Vec<&str> = request.split_whitespace().collect();

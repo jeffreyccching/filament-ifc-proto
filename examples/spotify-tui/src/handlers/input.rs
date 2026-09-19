@@ -6,6 +6,7 @@ use crate::network::IoEvent;
 use std::convert::TryInto;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+// Handle event when the search input block is active
 pub fn handler(key: Key, app: &mut App) {
   match key {
     Key::Ctrl('k') => {
@@ -94,11 +95,12 @@ pub fn handler(key: Key, app: &mut App) {
 }
 
 fn process_input(app: &mut App, input: String) {
-  
+  // Don't do anything if there is no input
   if input.is_empty() {
     return;
   }
 
+  // On searching for a track, clear the playlist selection
   app.selected_playlist_index = Some(0);
 
   if attempt_process_uri(app, &input, "https://open.spotify.com/", "/")
@@ -107,6 +109,7 @@ fn process_input(app: &mut App, input: String) {
     return;
   }
 
+  // Default fallback behavior: treat the input as a raw search phrase.
   app.dispatch(IoEvent::GetSearchResults(input, app.get_user_country()));
   app.push_navigation_stack(RouteId::Search, ActiveBlock::SearchResultBlock);
 }
@@ -118,11 +121,12 @@ fn spotify_resource_id(base: &str, uri: &str, sep: &str, resource_type: &str) ->
     .find('?')
     .unwrap_or_else(|| id_string_with_query_params.len());
   let id_string = id_string_with_query_params[0..query_idx].to_string();
-  
+  // If the lengths aren't equal, we must have found a match.
   let matched = id_string_with_query_params.len() != uri.len() && id_string.len() != uri.len();
   (id_string, matched)
 }
 
+// Returns true if the input was successfully processed as a Spotify URI.
 fn attempt_process_uri(app: &mut App, input: &str, base: &str, sep: &str) -> bool {
   let (album_id, matched) = spotify_resource_id(base, input, sep, "album");
   if matched {
@@ -299,6 +303,7 @@ mod tests {
     handler(Key::Backspace, &mut app);
     assert_eq!(app.input, str_to_vec_char("My tex"));
 
+    // Test that backspace deletes from the cursor position
     app.input_idx = 2;
     app.input_cursor_position = 2;
 
@@ -358,6 +363,7 @@ mod tests {
     handler(Key::Ctrl('b'), &mut app);
     assert_eq!(app.input_cursor_position, input_len - 5);
 
+    // Pretend to smash the left event to test the we have no out-of-bounds crash
     for _ in 0..20 {
       handler(Key::Left, &mut app);
     }
@@ -383,8 +389,8 @@ mod tests {
     let mut app = App::default();
 
     app.input = str_to_vec_char("你");
-    app.input_cursor_position = 2; 
-    app.input_idx = 1; 
+    app.input_cursor_position = 2; // 你 is 2 char wide
+    app.input_idx = 1; // 1 char
 
     handler(Key::Char('好'), &mut app);
 
@@ -472,7 +478,8 @@ mod tests {
 
     #[test]
     fn parse_with_query_parameters() {
-      
+      // If this test ever fails due to some change to the parsing logic, it is likely a sign we
+      // should just integrate the url crate instead of trying to do things ourselves.
       let playlist_url_with_query =
         "https://open.spotify.com/playlist/1cJ6lPBYj2fscs0kqBHsVV?si=OdwuJsbsSeuUAOadehng3A";
       let playlist_url = "https://open.spotify.com/playlist/1cJ6lPBYj2fscs0kqBHsVV";

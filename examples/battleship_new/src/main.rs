@@ -34,14 +34,14 @@ enum Ship {
 
 #[derive(Default)]
 struct Player<L: Label> {
-    
+    // Ship positions are secret to each player wrapped in label L.
     ship_positions: Labeled<Grid<bool>, L>,
 
     guesses: Grid<CellStatus>,
 }
 
 struct Placement {
-    
+    // 0: vertical, 1: horizontal.
     orientation: usize,
     start_row: usize,
     start_col: usize,
@@ -52,14 +52,14 @@ type PlayerA = Rec<
     Send<
         (usize, usize),
         Offer<
-            
+            // Case 1: The game is not finished yet.
             Recv<
-                
+                // Did the guess hit a ship?
                 bool,
-                
+                // Receive Player B's guess.
                 Recv<(usize, usize), Choose<Send<bool, Var<Z>>, Eps>>,
             >,
-            
+            // Case 2: PlayerB conceeds.
             Eps,
         >,
     >,
@@ -68,17 +68,17 @@ type PlayerB = Rec<
     Recv<
         (usize, usize),
         Choose<
-            
+            // Case 1: Player A did not win yet.
             Send<
-                
+                // Did the guess hit a ship?
                 bool,
                 Send<
-                    
+                    // Send Player B's guess.
                     (usize, usize),
                     Offer<Recv<bool, Var<Z>>, Eps>,
                 >,
             >,
-            
+            // Case 2: Player A won.
             Eps,
         >,
     >,
@@ -117,6 +117,7 @@ fn print_grid(grid: &Grid<CellStatus>) {
     }
 }
 
+// Guesses are in the format "[a-j] 1-10"
 fn read_guess(input: &mut dyn std::io::BufRead) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let mut line = String::new();
     input.read_line(&mut line)?;
@@ -140,14 +141,6 @@ fn is_occupied<L: Label>(grid: &Labeled<Grid<bool>, L>, row: usize, col: usize) 
     (&grid[row])[col].clone()
 }
 
-fn is_hit(grid: &Grid<CellStatus>, row: usize, col: usize) -> bool {
-    let status = (&grid[row])[col];
-    match status {
-        CellStatus::Hit => true,
-        _ => false,
-    }
-}
-
 fn count_hits(grid: &Grid<CellStatus>) -> usize {
     grid.iter().flatten().into_iter().fold(0, |sum, x| sum + if let CellStatus::Hit = x { 1 } else { 0 })
 }
@@ -157,7 +150,7 @@ fn did_win(guesses: &Grid<CellStatus>) -> bool {
     count_hits(guesses) == TOTAL_OCCUPIED_SQUARES
 }
 
-fn legal_placement<L: Label>(grid: &Labeled<Grid<bool>, L>, placement: &Placement) -> bool {
+fn legal_placement(grid: &Grid<bool>, placement: &Placement) -> bool {
     let mut r = placement.start_row;
     let mut c = placement.start_col;
     let rend = r + placement.size;
@@ -165,14 +158,15 @@ fn legal_placement<L: Label>(grid: &Labeled<Grid<bool>, L>, placement: &Placemen
     let row_step = if placement.orientation == 1 { 1 } else { 0 };
     let col_step = 1 - row_step;
 
-    while r < rend && c < cend && is_occupied(grid, r, c) == Labeled::<bool, L>::new(false) {
+    while r < rend && c < cend && grid[r][c] == false {
         r = r + row_step;
         c = c + col_step;
     }
     r == rend || c == cend
 }
 
-fn random_maybe_illegal_placement<L: Label>(grid: &Labeled<Grid<bool>, L>, ship: &Ship) -> Placement {
+// Cocoon's version takes a `grid` parameter that it never reads; dropped here.
+fn random_maybe_illegal_placement(ship: &Ship) -> Placement {
     let orientation = util::random(2);
     let mut row_limit = GRID_SIZE;
     let mut col_limit = GRID_SIZE;
@@ -194,15 +188,15 @@ fn random_maybe_illegal_placement<L: Label>(grid: &Labeled<Grid<bool>, L>, ship:
     }
 }
 
-fn random_placement<L: Label>(grid: &Labeled<Grid<bool>, L>, ship: &Ship) -> Placement {
-    let mut ship_placement = random_maybe_illegal_placement(grid, ship);
+fn random_placement(grid: &Grid<bool>, ship: &Ship) -> Placement {
+    let mut ship_placement = random_maybe_illegal_placement(ship);
     while legal_placement(grid, &ship_placement) == false {
-        ship_placement = random_maybe_illegal_placement(grid, ship);
+        ship_placement = random_maybe_illegal_placement(ship);
     }
     return ship_placement;
 }
 
-fn place_ship<L: Label>(grid: &mut Labeled<Grid<bool>, L>, placement: &Placement) {
+fn place_ship(grid: &mut Grid<bool>, placement: &Placement) {
     let row_step = if placement.orientation == 1 { 1 } else { 0 };
     let col_step: usize = 1 - row_step;
 
@@ -210,7 +204,7 @@ fn place_ship<L: Label>(grid: &mut Labeled<Grid<bool>, L>, placement: &Placement
     let mut col = placement.start_col;
 
     while row < placement.start_row + placement.size && col < placement.start_col + placement.size {
-        grid[row][col] = Labeled::<bool, L>::new(true);
+        grid[row][col] = true;
         row += row_step;
         col += col_step;
     }
@@ -219,14 +213,19 @@ fn place_ship<L: Label>(grid: &mut Labeled<Grid<bool>, L>, placement: &Placement
 impl<L: Label> Player<L> {
     pub fn new() -> Player<L> {
         let ships: [Ship; 5] = [Ship::Carrier, Ship::Battleship, Ship::Cruiser, Ship::Submarine, Ship::Destroyer];
-        let mut raw_positions = Labeled::<Grid<bool>, L>::new([[false; GRID_SIZE]; GRID_SIZE]);
+        // Placement runs on unlabeled data: the grid is derived from a RNG, not
+        // from any pre-existing secret, and is unobservable until it is wrapped.
+        // It acquires its policy at `Labeled::new` below. Cocoon must instead run
+        // this inside `secret_block!` in order to reach `wrap_secret`, which is
+        // why its `place_ship` needs `unchecked_operation` for the grid write.
+        let mut raw_positions: Grid<bool> = [[false; GRID_SIZE]; GRID_SIZE];
         for ship in &ships {
             let placement = random_placement(&raw_positions, ship);
             place_ship(&mut raw_positions, &placement);
         }
 
         Player {
-            ship_positions: raw_positions,
+            ship_positions: Labeled::<Grid<bool>, L>::new(raw_positions),
             guesses: [[CellStatus::Unguessed; GRID_SIZE]; GRID_SIZE],
         }
     }
@@ -267,7 +266,7 @@ fn game_loop_a(mut player: Player<A>, chan: session_types::Chan<(), PlayerA>) {
                 c2
             }
             Right(r) => {
-                
+                // Player A won on that guess.
                 r.close();
                 return;
             }
@@ -343,10 +342,28 @@ fn game_loop_b(mut player: Player<B>, chan: session_types::Chan<(), PlayerB>) {
                 c = c2.zero();
             }
             Right(r) => {
-                
+                // That was a winning guess.
                 r.close();
                 return;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The five ships occupy 5+4+3+3+2 = 17 cells, which is what `did_win`
+    /// relies on via TOTAL_OCCUPIED_SQUARES. If `legal_placement` does not
+    /// actually consult the grid, ships overlap and the count comes out low.
+    #[test]
+    fn ships_do_not_overlap() {
+        for trial in 0..200 {
+            let p = Player::<A>::new();
+            let grid = declassify(p.ship_positions);
+            let occupied = grid.iter().flatten().filter(|&&c| c).count();
+            assert_eq!(occupied, 17, "trial {trial}: {occupied} occupied cells, expected 17 (ships overlap)");
         }
     }
 }

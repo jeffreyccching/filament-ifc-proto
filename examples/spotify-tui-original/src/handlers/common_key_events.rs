@@ -141,7 +141,7 @@ pub fn handle_right_event(app: &mut App) {
 }
 
 pub fn handle_left_event(app: &mut App) {
-  
+  // TODO: This should send you back to either library or playlist based on last selection
   app.set_current_route_state(Some(ActiveBlock::Empty), Some(ActiveBlock::Library));
 }
 
@@ -158,6 +158,7 @@ mod tests {
 
     assert_eq!(next_index, 1);
 
+    // Selection wrap if on last item
     let index = data.len() - 1;
     let next_index = on_down_press_handler(&data, Some(index));
     assert_eq!(next_index, 0);
@@ -172,6 +173,7 @@ mod tests {
 
     assert_eq!(next_index, index - 1);
 
+    // Selection wrap if on first item
     let index = 0;
     let next_index = on_up_press_handler(&data, Some(index));
     assert_eq!(next_index, data.len() - 1);

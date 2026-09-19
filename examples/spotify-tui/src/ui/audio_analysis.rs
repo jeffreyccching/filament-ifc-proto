@@ -106,7 +106,7 @@ where
         .map(|(index, pitch)| {
           let display_pitch = *PITCHES.get(index).unwrap_or(&PITCHES[0]);
           let bar_value = ((pitch * 1000.0) as u64)
-            
+            // Add a beat offset to make the bar animate between beats
             .checked_add((beat_offset * 3000.0) as u64)
             .unwrap_or(0);
 

@@ -32,6 +32,9 @@ use tokio::sync::Mutex;
 use tokio::try_join;
 use typing_rules::lattice::{Label, Labeled, A, LEQ};
 
+/// Safe output port for Spotify OAuth token refresh.
+/// Enforces at compile time that the data label `Src` flows to the port label `A`,
+/// preventing unauthorized declassification.
 async fn safe_get_token<Src: Label + LEQ<A>>(
   oauth: &mut Labeled<SpotifyOAuth, Src>,
 ) -> Option<TokenInfo> {
@@ -102,7 +105,7 @@ pub fn get_spotify(token_info: TokenInfo) -> (Spotify, SystemTime) {
     if let Some(expires_at) = token_info.expires_at {
       SystemTime::UNIX_EPOCH
         + Duration::from_secs(expires_at as u64)
-        
+        // Set 10 seconds early
         - Duration::from_secs(10)
     } else {
       SystemTime::now()
@@ -338,7 +341,7 @@ impl<'a> Network<'a> {
       app.push_navigation_stack(RouteId::SelectedDevice, ActiveBlock::SelectDevice);
       if !result.devices.is_empty() {
         app.devices = Some(result);
-        
+        // Select the first device in the list
         app.selected_device_index = Some(0);
       }
     }
@@ -366,7 +369,7 @@ impl<'a> Network<'a> {
                 app.dispatch(IoEvent::CurrentUserSavedTracksContains(vec![track_id]));
               };
             }
-            PlayingItem::Episode(_episode) => {  }
+            PlayingItem::Episode(_episode) => { /*should map this to following the podcast show*/ }
           }
         };
       }
@@ -393,7 +396,7 @@ impl<'a> Network<'a> {
             if *is_liked {
               app.liked_song_ids_set.insert(id.to_string());
             } else {
-              
+              // The song is not liked, so check if it should be removed
               if app.liked_song_ids_set.contains(id) {
                 app.liked_song_ids_set.remove(id);
               }
@@ -445,6 +448,7 @@ impl<'a> Network<'a> {
     let mut app = self.app.lock().await;
     app.track_table.tracks = tracks.clone();
 
+    // Send this event round (don't block here)
     app.dispatch(IoEvent::CurrentUserSavedTracksContains(
       tracks
         .into_iter()
@@ -494,7 +498,7 @@ impl<'a> Network<'a> {
       .await
     {
       Ok(saved_shows) => {
-        
+        // not to show a blank page
         if !saved_shows.items.is_empty() {
           let mut app = self.app.lock().await;
           app.library.saved_shows.add_pages(saved_shows);
@@ -630,6 +634,7 @@ impl<'a> Network<'a> {
       None,
     );
 
+    // Run the futures concurrently
     match try_join!(
       search_track,
       search_artist,
@@ -652,6 +657,7 @@ impl<'a> Network<'a> {
           .filter_map(|item| item.id.to_owned())
           .collect();
 
+        // Check if these artists are followed
         app.dispatch(IoEvent::UserArtistFollowCheck(artist_ids));
 
         let album_ids = album_results
@@ -660,6 +666,7 @@ impl<'a> Network<'a> {
           .filter_map(|album| album.id.to_owned())
           .collect();
 
+        // Check if these albums are saved
         app.dispatch(IoEvent::CurrentUserSavedAlbumsContains(album_ids));
 
         let show_ids = show_results
@@ -668,6 +675,7 @@ impl<'a> Network<'a> {
           .map(|show| show.id.to_owned())
           .collect();
 
+        // check if these shows are saved
         app.dispatch(IoEvent::CurrentUserSavedShowsContains(show_ids));
 
         app.search_results.tracks = Some(track_results);
@@ -769,7 +777,8 @@ impl<'a> Network<'a> {
         .await
       {
         Ok(()) => {
-          
+          // Wait between seek and status query.
+          // Without it, the Spotify API may return the old progress.
           tokio::time::delay_for(Duration::from_millis(1000)).await;
           self.get_current_playback().await;
         }
@@ -817,7 +826,8 @@ impl<'a> Network<'a> {
       .await
     {
       Ok(()) => {
-        
+        // Update the UI eagerly (otherwise the UI will wait until the next 5 second interval
+        // due to polling playback context)
         let mut app = self.app.lock().await;
         if let Some(current_playback_context) = &mut app.current_playback_context {
           current_playback_context.shuffle_state = !shuffle_state;
@@ -980,18 +990,18 @@ impl<'a> Network<'a> {
     match self
       .spotify
       .recommendations(
-        seed_artists,            
-        None,                    
-        seed_tracks,             
-        self.large_search_limit, 
-        country,                 
-        &empty_payload,          
+        seed_artists,            // artists
+        None,                    // genres
+        seed_tracks,             // tracks
+        self.large_search_limit, // adjust playlist to screen size
+        country,                 // country
+        &empty_payload,          // payload
       )
       .await
     {
       Ok(result) => {
         if let Some(mut recommended_tracks) = self.extract_recommended_tracks(&result).await {
-          
+          //custom first track
           if let Some(track) = *first_track {
             recommended_tracks.insert(0, track);
           }
@@ -1078,7 +1088,7 @@ impl<'a> Network<'a> {
             .await
           {
             Ok(()) => {
-              
+              // TODO: This should ideally use the same logic as `self.current_user_saved_tracks_contains`
               let mut app = self.app.lock().await;
               app.liked_song_ids_set.insert(track_id);
             }
@@ -1131,7 +1141,7 @@ impl<'a> Network<'a> {
       .await
     {
       Ok(saved_albums) => {
-        
+        // not to show a blank page
         if !saved_albums.items.is_empty() {
           let mut app = self.app.lock().await;
           app.library.saved_albums.add_pages(saved_albums);
@@ -1355,7 +1365,7 @@ impl<'a> Network<'a> {
       Ok(p) => {
         let mut app = self.app.lock().await;
         app.playlists = Some(p);
-        
+        // Select the first playlist
         app.selected_playlist_index = Some(0);
       }
       Err(e) => {
@@ -1411,18 +1421,19 @@ impl<'a> Network<'a> {
   async fn get_album_for_track(&mut self, track_id: String) {
     match self.spotify.track(&track_id).await {
       Ok(track) => {
-        
+        // It is unclear when the id can ever be None, but perhaps a track can be album-less. If
+        // so, there isn't much to do here anyways, since we're looking for the parent album.
         let album_id = match track.album.id {
           Some(id) => id,
           None => return,
         };
 
         if let Ok(album) = self.spotify.album(&album_id).await {
-          
+          // The way we map to the UI is zero-indexed, but Spotify is 1-indexed.
           let zero_indexed_track_number = track.track_number - 1;
           let selected_album = SelectedFullAlbum {
             album,
-            
+            // Overflow should be essentially impossible here, so we prefer the cleaner 'as'.
             selected_index: zero_indexed_track_number as usize,
           };
 
@@ -1470,7 +1481,7 @@ impl<'a> Network<'a> {
       app.spotify_token_expiry = new_token_expiry;
     } else {
       println!("\nFailed to refresh authentication token");
-      
+      // TODO panic!
     }
   }
 

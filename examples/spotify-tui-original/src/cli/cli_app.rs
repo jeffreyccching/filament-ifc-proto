@@ -12,13 +12,17 @@ pub struct CliApp<'a> {
   pub config: UserConfig,
 }
 
+// Non-concurrent functions
+// I feel that async in a cli is not working
+// I just .await all processes and directly interact
+// by calling network.handle_network_event
 impl<'a> CliApp<'a> {
   pub fn new(net: Network<'a>, config: UserConfig) -> Self {
     Self { net, config }
   }
 
   async fn is_a_saved_track(&mut self, id: &str) -> bool {
-    
+    // Update the liked_song_ids_set
     self
       .net
       .handle_network_event(IoEvent::CurrentUserSavedTracksContains(
@@ -32,13 +36,14 @@ impl<'a> CliApp<'a> {
     for val in values {
       format = format.replace(val.get_placeholder(), &val.inner(self.config.clone()));
     }
-    
+    // Replace unsupported flags with 'None'
     for p in &["%a", "%b", "%t", "%p", "%h", "%u", "%d", "%v", "%f", "%s"] {
       format = format.replace(p, "None");
     }
     format.trim().to_string()
   }
 
+  // spt playback -t
   pub async fn toggle_playback(&mut self) {
     let context = self.net.app.lock().await.current_playback_context.clone();
     if let Some(c) = context {
@@ -53,6 +58,8 @@ impl<'a> CliApp<'a> {
       .await;
   }
 
+  // spt pb --share-track (share the current playing song)
+  // Basically copy-pasted the 'copy_song_url' function
   pub async fn share_track_or_episode(&mut self) -> Result<String> {
     let app = self.net.app.lock().await;
     if let Some(CurrentlyPlaybackContext {
@@ -76,6 +83,8 @@ impl<'a> CliApp<'a> {
     }
   }
 
+  // spt pb --share-album (share the current album)
+  // Basically copy-pasted the 'copy_album_url' function
   pub async fn share_album_or_show(&mut self) -> Result<String> {
     let app = self.net.app.lock().await;
     if let Some(CurrentlyPlaybackContext {
@@ -99,15 +108,16 @@ impl<'a> CliApp<'a> {
     }
   }
 
+  // spt ... -d ... (specify device to control)
   pub async fn set_device(&mut self, name: String) -> Result<()> {
-    
+    // Change the device if specified by user
     let mut app = self.net.app.lock().await;
     let mut device_index = 0;
     if let Some(dp) = &app.devices {
       for (i, d) in dp.devices.iter().enumerate() {
         if d.name == name {
           device_index = i;
-          
+          // Save the id of the device
           self
             .net
             .client_config
@@ -116,18 +126,20 @@ impl<'a> CliApp<'a> {
         }
       }
     } else {
-      
+      // Error out if no device is available
       return Err(anyhow!("no device available"));
     }
     app.selected_device_index = Some(device_index);
     Ok(())
   }
 
+  // spt query ... --limit LIMIT (set max search limit)
   pub async fn update_query_limits(&mut self, max: String) -> Result<()> {
     let num = max
       .parse::<u32>()
       .map_err(|_e| anyhow!("limit must be between 1 and 50"))?;
 
+    // 50 seems to be the maximum limit
     if num > 50 || num == 0 {
       return Err(anyhow!("limit must be between 1 and 50"));
     };
@@ -144,6 +156,7 @@ impl<'a> CliApp<'a> {
       .parse::<u32>()
       .map_err(|_e| anyhow!("volume must be between 0 and 100"))?;
 
+    // Check if it's in range
     if num > 100 {
       return Err(anyhow!("volume must be between 0 and 100"));
     };
@@ -155,6 +168,7 @@ impl<'a> CliApp<'a> {
     Ok(())
   }
 
+  // spt playback --next / --previous
   pub async fn jump(&mut self, d: &JumpDirection) {
     match d {
       JumpDirection::Next => self.net.handle_network_event(IoEvent::NextTrack).await,
@@ -162,6 +176,7 @@ impl<'a> CliApp<'a> {
     }
   }
 
+  // spt query -l ...
   pub async fn list(&mut self, item: Type, format: &str) -> String {
     match item {
       Type::Device => {
@@ -222,20 +237,21 @@ impl<'a> CliApp<'a> {
             )
           })
           .collect::<Vec<String>>();
-        
+        // Check if there are any liked songs
         if liked_songs.is_empty() {
           "No liked songs found".to_string()
         } else {
           liked_songs.join("\n")
         }
       }
-      
+      // Enforced by clap
       _ => unreachable!(),
     }
   }
 
+  // spt playback --transfer DEVICE
   pub async fn transfer_playback(&mut self, device: &str) -> Result<()> {
-    
+    // Get the device id by name
     let mut id = String::new();
     if let Some(devices) = &self.net.app.lock().await.devices {
       for d in &devices.devices {
@@ -286,26 +302,30 @@ impl<'a> CliApp<'a> {
       }
     };
 
+    // Convert secs to ms
     let ms = seconds * 1000;
-    
+    // Calculate new positon
     let position_to_seek = if seconds_str.starts_with('+') {
       current_pos + ms
     } else if seconds_str.starts_with('-') {
-      
+      // Jump to the beginning if the position_to_seek would be
+      // negative, must be checked before the calculation to avoid
+      // an 'underflow'
       if ms > current_pos {
         0u32
       } else {
         current_pos - ms
       }
     } else {
-      
+      // Absolute value of the track
       seconds * 1000
     };
 
+    // Check if position_to_seek is greater than duration (next track)
     if position_to_seek > duration {
       self.jump(&JumpDirection::Next).await;
     } else {
-      
+      // This seeks to a position in the current song
       self
         .net
         .handle_network_event(IoEvent::Seek(position_to_seek))
@@ -315,6 +335,7 @@ impl<'a> CliApp<'a> {
     Ok(())
   }
 
+  // spt playback --like / --dislike / --shuffle / --repeat
   pub async fn mark(&mut self, flag: Flag) -> Result<()> {
     let c = {
       let app = self.net.app.lock().await;
@@ -326,7 +347,7 @@ impl<'a> CliApp<'a> {
 
     match flag {
       Flag::Like(s) => {
-        
+        // Get the id of the current song
         let id = match c.item {
           Some(i) => match i {
             PlayingItem::Track(t) => t.id.ok_or_else(|| anyhow!("item has no id")),
@@ -335,12 +356,15 @@ impl<'a> CliApp<'a> {
           None => Err(anyhow!("no item playing")),
         }?;
 
+        // Want to like but is already liked -> do nothing
+        // Want to like and is not liked yet -> like
         if s && !self.is_a_saved_track(&id).await {
           self
             .net
             .handle_network_event(IoEvent::ToggleSaveTrack(id))
             .await;
-        
+        // Want to dislike but is already disliked -> do nothing
+        // Want to dislike and is liked currently -> remove like
         } else if !s && self.is_a_saved_track(&id).await {
           self
             .net
@@ -365,8 +389,9 @@ impl<'a> CliApp<'a> {
     Ok(())
   }
 
+  // spt playback -s
   pub async fn get_status(&mut self, format: String) -> Result<String> {
-    
+    // Update info on current playback
     self
       .net
       .handle_network_event(IoEvent::GetCurrentPlayback)
@@ -422,9 +447,10 @@ impl<'a> CliApp<'a> {
     Ok(self.format_output(format, hs))
   }
 
+  // spt play -u URI
   pub async fn play_uri(&mut self, uri: String, queue: bool, random: bool) {
     let offset = if random {
-      
+      // Only works with playlists for now
       if uri.contains("spotify:playlist:") {
         let id = uri.split(':').last().unwrap();
         match self.net.spotify.playlist(id, None, None).await {
@@ -473,12 +499,14 @@ impl<'a> CliApp<'a> {
     }
   }
 
+  // spt play -n NAME ...
   pub async fn play(&mut self, name: String, item: Type, queue: bool, random: bool) -> Result<()> {
     self
       .net
       .handle_network_event(IoEvent::GetSearchResults(name.clone(), None))
       .await;
-    
+    // Get the uri of the first found
+    // item + the offset or return an error message
     let uri = {
       let results = &self.net.app.lock().await.search_results;
       match item {
@@ -518,7 +546,7 @@ impl<'a> CliApp<'a> {
         Type::Playlist => {
           if let Some(r) = &results.playlists {
             let p = &r.items[0];
-            
+            // For a random song, create a random offset
             p.uri.clone()
           } else {
             return Err(anyhow!("no playlists with name '{}'", name));
@@ -528,11 +556,13 @@ impl<'a> CliApp<'a> {
       }
     };
 
+    // Play or queue the uri
     self.play_uri(uri, queue, random).await;
 
     Ok(())
   }
 
+  // spt query -s SEARCH ...
   pub async fn query(&mut self, search: String, format: String, item: Type) -> String {
     self
       .net
@@ -626,7 +656,7 @@ impl<'a> CliApp<'a> {
           format!("no albums with name '{}'", search)
         }
       }
-      
+      // Enforced by clap
       _ => unreachable!(),
     }
   }

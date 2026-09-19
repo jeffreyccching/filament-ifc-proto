@@ -48,6 +48,22 @@ where
 
 unsafe impl<T: InvisibleSideEffectFree> InvisibleSideEffectFree for Vetted<T> {}
 
+/// Identity gate that only compiles if `v` is a `Vetted<T>` — i.e. if the callee
+/// that produced it was annotated `#[side_effect_free_attr]`.
+///
+/// Emitted by `#[side_effect_free_attr]`'s *checking* path around every call
+/// whose callee is not on the allowlist. This is the mechanism that makes the
+/// effect system transitive: a side-effect-free function may only call other
+/// side-effect-free (or allowlisted) functions.
+///
+/// It returns the `Vetted` wrapper rather than unwrapping it so the checking
+/// path stays type-compatible with the executed path, where the caller writes
+/// the `.unwrap()` itself.
+#[inline(always)]
+pub fn require_vetted<T: InvisibleSideEffectFree>(v: Vetted<T>) -> Vetted<T> {
+    v
+}
+
 /// Identity function that acts as a compile-time gate: returns `x` unchanged, but only
 /// compiles if `T: InvisibleSideEffectFree`. The macro wraps expressions in this call so
 /// that any type without the trait produces a type error at the point of use.
@@ -255,111 +271,149 @@ where
 }
 
 // =========================================================================
-// 6. PC BLOCK FUNCTION CALL RESULT HANDLING (Autoref Specialization)
+// 6. PC-GUARDED WRITES (Autoref Specialization)
 // =========================================================================
 
-/// Autoref specialization for handling function call results inside pc_block.
-/// - For functions with #[side_effect_free_attr] that return Vetted<T>: unwraps Vetted, returns T
-/// - For other functions returning raw T: wraps in Labeled<T, Public>
-pub struct PcCallResult;
-
-// High priority (inherent method): matches Vetted<T> → unwraps to T
-impl PcCallResult {
-    /// Unwraps a `Vetted<T>` returned by a `#[side_effect_free_attr]` function,
-    /// yielding the bare `T`. Takes priority over the trait fallback because
-    /// inherent methods are preferred in autoref resolution.
-    pub fn wrap_result<T: InvisibleSideEffectFree>(&self, x: Vetted<T>) -> T {
-        x.unwrap()
-    }
-}
-
-// Low priority (trait method): matches any T → wraps in Labeled<T, Public>
-pub trait PcCallResultFallback {
-    /// Wraps a plain `T` returned by an ordinary (non-vetted) function call inside
-    /// `Labeled<T, Public>`, treating the result as public. This is the fallback path
-    /// when the function is not annotated with `#[side_effect_free_attr]`.
-    fn wrap_result<T: InvisibleSideEffectFree>(&self, x: T) -> Labeled<T, Public>;
-}
-
-impl PcCallResultFallback for PcCallResult {
-    /// Fallback: boxes the value as `Labeled<T, Public>` so the macro can assign it
-    /// to a labeled destination with the usual flow checks.
-    fn wrap_result<T: InvisibleSideEffectFree>(&self, x: T) -> Labeled<T, Public> {
-        Labeled::new(x)
-    }
-}
-
-// =========================================================================
-// 7. PC-AWARE ISEF CHECK (Autoref Specialization)
-// =========================================================================
-
-/// PC-aware side-effect checker.
-/// When PC is Public, no InvisibleSideEffectFree check is required
-/// (no information leak risk in a Public context).
-/// When PC is Secret (A, B, AB, etc.), InvisibleSideEffectFree is enforced.
+/// Target of a write inside `pc_block!`'s checking path: the left-hand side
+/// of `=` and of compound assignment, the operand of `&mut`, and the receiver
+/// of a mutating safe method.
 ///
-/// Uses the same autoref specialization pattern as PcCallResult:
-/// - PcIsef<Public> has an inherent `check<T>` (no ISEF bound) → higher priority
-/// - PcIsefFallback trait has `check<T: ISEF>` → lower priority, used for non-Public PCs
-pub struct PcIsef<PC: Label>(std::marker::PhantomData<PC>);
+/// `PcWrite(&mut target).guard(&__pc)` compiles only if the write respects
+/// the PC:
+/// - `Labeled<T, L>` target (inherent method, chosen first): `PC ⊑ L`.
+/// - any other target (trait fallback): the target is unlabeled, i.e.
+///   Public, so the PC must be `Public`. Writing a raw value under a raised
+///   PC would let secret-dependent data outlive the branch unlabeled.
+pub struct PcWrite<'a, T: ?Sized>(pub &'a mut T);
 
-impl<PC: Label> PcIsef<PC> {
-    /// Constructs a `PcIsef` token from a reference to the current PC label.
-    /// The PC value itself is not stored; only its type is captured via `PhantomData`
-    /// so the correct `check` overload is selected at compile time.
+impl<'a, T, L: Label> PcWrite<'a, Labeled<T, L>> {
+    /// Accepts the write when the current PC flows to the target's label.
     #[inline(always)]
-    pub fn new(_pc: &PC) -> Self {
-        PcIsef(std::marker::PhantomData)
+    pub fn guard<PC: Label + LEQ<L>>(self, _pc: &PC) -> &'a mut Labeled<T, L> {
+        self.0
     }
 }
 
-// Public PC: no ISEF check needed (inherent method → higher priority)
-impl PcIsef<Public> {
-    /// Identity function with no `InvisibleSideEffectFree` bound. When the PC is
-    /// `Public` there is no risk of leaking secrets through side effects, so any
-    /// type is accepted. Takes priority over the trait fallback via autoref.
+pub trait PcWriteFallback<'a, T: ?Sized> {
+    /// Accepts a write to an unlabeled target only under a `Public` PC.
+    fn guard(self, pc: &Public) -> &'a mut T;
+}
+
+impl<'a, T: ?Sized> PcWriteFallback<'a, T> for PcWrite<'a, T> {
     #[inline(always)]
-    pub fn check<T>(&self, x: T) -> T {
-        x
-    }
-    /// Identity function that accepts macros unconditionally under a `Public` PC.
-    /// When the PC is secret the trait fallback requires `MacroSideEffectFree`,
-    /// which nothing implements, causing a compile error for macros like `println!`.
-    #[inline(always)]
-    pub fn reject_side_effecting_macro<T>(&self, x: T) -> T {
-        x
+    fn guard(self, _pc: &Public) -> &'a mut T {
+        self.0
     }
 }
 
-/// Marker trait that nothing implements. Used to reject side-effecting macros
-/// (like println!) under a non-Public PC. The non-Public fallback trait requires
-/// this bound, which always fails, producing a compile error. The Public inherent
-/// method has no such bound, so it compiles fine.
-pub trait MacroSideEffectFree {}
-
-// Any PC: requires ISEF (trait method → lower priority, used for non-Public)
-pub trait PcIsefFallback {
-    /// Enforces `InvisibleSideEffectFree` on `T` when the PC is secret. If `T`
-    /// does not implement the trait the call site fails to compile, preventing
-    /// side-effecting values from leaking the secret condition.
-    fn check<T: InvisibleSideEffectFree>(&self, x: T) -> T;
-    /// Rejects side-effecting macros (e.g. `println!`) under a secret PC by
-    /// requiring `MacroSideEffectFree`, a trait with no implementations. This
-    /// makes any such macro call a compile error inside a secret branch.
-    fn reject_side_effecting_macro<T: MacroSideEffectFree>(&self, x: T) -> T;
+/// Cocoon's `check_ISEF_mut_ref`: identity on `&mut T` that only compiles if
+/// `T: InvisibleSideEffectFree`.
+#[inline(always)]
+pub fn check_isef_mut<T: InvisibleSideEffectFree + ?Sized>(x: &mut T) -> &mut T {
+    x
 }
 
-impl<PC: Label> PcIsefFallback for PcIsef<PC> {
-    /// Passes `x` through after the `InvisibleSideEffectFree` bound is satisfied.
+/// Cocoon's `check_expr_secret_block_safe_ref`: identity on `&T` that only
+/// compiles if `T: InvisibleSideEffectFree`.
+#[inline(always)]
+pub fn check_isef_ref<T: InvisibleSideEffectFree + ?Sized>(x: &T) -> &T {
+    x
+}
+
+/// Implemented for every type that contains no mutable reference, raw
+/// mutable pointer or interior mutability.
+pub unsafe auto trait NoMutRef {}
+impl<T: ?Sized> !NoMutRef for &mut T {}
+impl<T: ?Sized> !NoMutRef for *mut T {}
+impl<T: ?Sized> !NoMutRef for ::std::cell::UnsafeCell<T> {}
+
+/// Gate on each argument of a call inside `pc_block!` whose labeled arguments
+/// are unwrapped (`__chain`). The callee sees those arguments raw, so a
+/// mutable reference among its arguments would let it store secret data
+/// somewhere the PC never checks.
+#[inline(always)]
+pub fn check_call_arg<T: NoMutRef>(x: T) -> T {
+    x
+}
+
+/// Cocoon's `check_ISEF_unsafe`: a bitwise copy of a variable, so the
+/// checking path can require `T: InvisibleSideEffectFree` on every variable
+/// the block reads without moving or borrowing it for real. Emitted only in
+/// the checking path, which never runs.
+#[inline(always)]
+pub unsafe fn check_isef_unsafe<T: InvisibleSideEffectFree>(x: &T) -> T {
+    std::ptr::read(x)
+}
+
+// =========================================================================
+// 7. BRANCH VALUES AND `if let` SCRUTINEES (Autoref Specialization)
+// =========================================================================
+
+/// The value of an `if` / `if let` expression inside `pc_block!`.
+///
+/// The PC is raised only inside the branches, so a value leaving a branch
+/// must carry the condition's label itself:
+/// - `Labeled<T, L>` → `Labeled<T, L ⊔ C>`;
+/// - `()` → `()`;
+/// - any other (raw) value (trait fallback) → only when the condition is
+///   `Public`.
+pub struct BranchValue<T>(pub T);
+
+impl<T, L: Label> BranchValue<Labeled<T, L>> {
     #[inline(always)]
-    fn check<T: InvisibleSideEffectFree>(&self, x: T) -> T {
-        x
+    pub fn lift<C: Label>(self, _cond: &C) -> Labeled<T, <L as Join<C>>::Out>
+    where
+        L: Join<C>,
+    {
+        let mut v = self.0;
+        Labeled::new(v.value.take().unwrap())
     }
-    /// Passes `x` through after the `MacroSideEffectFree` bound is satisfied
-    /// (which it never is — this path exists only to produce compile errors).
+}
+
+impl BranchValue<()> {
     #[inline(always)]
-    fn reject_side_effecting_macro<T: MacroSideEffectFree>(&self, x: T) -> T {
-        x
+    pub fn lift<C: Label>(self, _cond: &C) {}
+}
+
+pub trait BranchValueFallback<T> {
+    fn lift(self, cond: &Public) -> T;
+}
+
+impl<T> BranchValueFallback<T> for BranchValue<T> {
+    #[inline(always)]
+    fn lift(self, _cond: &Public) -> T {
+        self.0
+    }
+}
+
+/// The scrutinee of an `if let` inside `pc_block!`. A labeled scrutinee is
+/// unwrapped for matching and its label returned so the macro can raise the
+/// PC inside the branches; a raw scrutinee is Public.
+pub struct Scrutinee<T>(pub T);
+
+impl<T, L: Label> Scrutinee<Labeled<T, L>> {
+    #[inline(always)]
+    pub fn inspect_scrutinee(self) -> (T, L) {
+        let mut v = self.0;
+        (v.value.take().unwrap(), L::default())
+    }
+}
+
+impl<'a, T, L: Label> Scrutinee<&'a Labeled<T, L>> {
+    #[inline(always)]
+    pub fn inspect_scrutinee(self) -> (&'a T, L) {
+        (self.0.value.as_ref().unwrap(), L::default())
+    }
+}
+
+pub trait ScrutineeFallback<T> {
+    fn inspect_scrutinee(self) -> (T, Public);
+}
+
+impl<T> ScrutineeFallback<T> for Scrutinee<T> {
+    #[inline(always)]
+    fn inspect_scrutinee(self) -> (T, Public) {
+        (self.0, Public)
     }
 }
 
@@ -435,3 +489,128 @@ unsafe impl<T: InvisibleSideEffectFree> SafeRangeBounds for std::ops::RangeTo<T>
 unsafe impl<T: InvisibleSideEffectFree> SafeRangeBounds for std::ops::RangeInclusive<T> {}
 unsafe impl SafeRangeBounds for std::ops::RangeFull {}
 unsafe impl<T: InvisibleSideEffectFree> SafeRangeBounds for std::ops::RangeToInclusive<T> {}
+
+// =========================================================================
+// 10. MUTATION BAN SUPPORT (NotLabeled) + CLOSURE CAPTURE GATE
+// =========================================================================
+
+/// Implemented for every type except `Labeled<T, L>`.
+/// Used by `PcVisibleSideEffectFree` to ban capturing `&mut` to plain
+/// (non-Labeled) variables from outside a `pc_block!`.
+pub unsafe auto trait NotLabeled {}
+impl<T, L: crate::lattice::Label> !NotLabeled for crate::lattice::Labeled<T, L> {}
+
+// ── Closure-capture gate (mirrors Cocoon's VisibleSideEffectFree) ────────────
+
+/// Auto trait: the checking-path closure of `pc_block!` must satisfy this.
+/// A closure satisfies it only if every reference it captures does too.
+/// Negative impls below ban `&mut` / `*mut` to non-Labeled captures —
+/// the primary write channels that could leak through a secret PC.
+pub unsafe auto trait PcVisibleSideEffectFree {}
+
+// Mutable refs/ptrs to plain (non-Labeled) types are banned — write channels.
+impl<T: NotLabeled> !PcVisibleSideEffectFree for &mut T {}
+impl<T: NotLabeled> !PcVisibleSideEffectFree for *mut T {}
+// Interior mutability is a write channel even behind `&`. (A negative impl may
+// not add bounds the struct itself lacks (E0367), so this covers every T.)
+impl<T: ?Sized> !PcVisibleSideEffectFree for ::std::cell::UnsafeCell<T> {}
+
+// Mutable refs to Labeled values are allowed — the only valid mutation targets.
+// The inner type must be ISEF (Cocoon's `SecretValueSafe`), so a captured
+// `Labeled<RefCell<_>, _>` cannot be mutated through shared access.
+unsafe impl<T: InvisibleSideEffectFree, L: crate::lattice::Label> PcVisibleSideEffectFree
+    for &mut crate::lattice::Labeled<T, L> {}
+unsafe impl<T: InvisibleSideEffectFree, L: crate::lattice::Label> PcVisibleSideEffectFree
+    for &mut &mut crate::lattice::Labeled<T, L> {}
+
+// Shared (`&T`) captures need a different rule than mutable ones: reading a
+// value isn't a write channel, but it can still leak via an observable Drop /
+// Display / Deref on that value if the type isn't ISEF.
+//
+// Rust has no direct "trait NOT implemented" bound, so this uses Cocoon's
+// double-negation trick. Note the `T: InvisibleSideEffectFree` bound sits on
+// the *struct definition* — a negative impl may not add bounds the type itself
+// doesn't declare (E0367).
+struct __PcWrap<T: InvisibleSideEffectFree> {
+    _pd: ::std::marker::PhantomData<T>,
+}
+
+unsafe auto trait __WrappedNotPcISEF {}
+impl<T: InvisibleSideEffectFree> !__WrappedNotPcISEF for __PcWrap<T> {}
+
+// If `__PcWrap<T>` still implements `__WrappedNotPcISEF` (i.e. T is NOT ISEF),
+// then `&T` is barred from being captured.
+impl<T> !PcVisibleSideEffectFree for &T where __PcWrap<T>: __WrappedNotPcISEF {}
+unsafe impl<T: InvisibleSideEffectFree> PcVisibleSideEffectFree for &T {}
+
+/// Invokes a closure, gating on `PcVisibleSideEffectFree`.
+/// Used only in the checking path (the `else` branch of `if true`), so it
+/// never actually runs — only the type-check matters.
+pub fn call_pc_closure<F, R>(clos: F) -> R
+where
+    F: FnOnce() -> R + PcVisibleSideEffectFree,
+{
+    clos()
+}
+
+// =========================================================================
+// PANIC OUTPUT SUPPRESSION INSIDE `pc_block!`
+//
+// A panic message can carry secret-derived data ("index out of bounds: the
+// len is 3 but the index is 7"), so output is suppressed while a block runs.
+// The block still aborts on panic — see `pc_block!`'s expansion for why
+// recovery would leak once the PC can drop back after a branch.
+//
+// The hook is installed ONCE and consults a thread-local flag, rather than
+// being swapped per block. Swapping `std::panic::set_hook` around every
+// block mutates process-global state: two threads in `pc_block!` at once
+// interleave, and one restores the other's silencing hook permanently. It
+// also costs two global RwLock acquisitions and an allocation per entry,
+// which is paid every iteration when a block sits inside a loop.
+// =========================================================================
+
+static PC_HOOK_INIT: ::std::sync::Once = ::std::sync::Once::new();
+
+thread_local! {
+    /// True while this thread is inside a `pc_block!`.
+    static PC_SILENCE: ::std::cell::Cell<bool> = const { ::std::cell::Cell::new(false) };
+}
+
+/// Suppresses panic output on the current thread for as long as it is alive.
+/// Created by `pc_block!` outside the block's closure, so it is not captured
+/// and does not affect the `PcVisibleSideEffectFree` capture gate.
+///
+/// Note: an application that installs its own panic hook *after* the first
+/// `pc_block!` has run replaces the hook below and disables suppression.
+/// That is the application's choice, and it cannot re-enable a leak that the
+/// abort-on-panic rule already prevents.
+pub struct PanicSilencer(bool);
+
+impl PanicSilencer {
+    pub fn new() -> Self {
+        PC_HOOK_INIT.call_once(|| {
+            let prev = ::std::panic::take_hook();
+            ::std::panic::set_hook(::std::boxed::Box::new(move |info| {
+                // Inside a block: stay quiet. Outside: behave exactly as before.
+                if PC_SILENCE.with(|s| s.get()) {
+                    return;
+                }
+                prev(info);
+            }));
+        });
+        // Save the previous value so nested blocks compose.
+        Self(PC_SILENCE.with(|s| s.replace(true)))
+    }
+}
+
+impl Default for PanicSilencer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PanicSilencer {
+    fn drop(&mut self) {
+        PC_SILENCE.with(|s| s.set(self.0));
+    }
+}

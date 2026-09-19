@@ -1,7 +1,15 @@
 //! IFC-aware I/O wrappers for the standard library.
 //!
-//! Provides labeled handles for all external system boundaries that
-//! enforce LEQ lattice bounds at compile time.
+//! A handle at label `L` mediates one external boundary in both directions:
+//!
+//! - **writes** require `Src: LEQ<L>` — no write-down;
+//! - **reads** return `Labeled<_, L>` — data from an `L` source carries `L`,
+//!   guaranteed by the signature rather than by the caller remembering to
+//!   wrap the call in `mcall!`.
+//!
+//! Handles are *not* wrapped in `Labeled`: the handle type already carries
+//! `L` in its own `PhantomData<L>`, so methods are called directly and no
+//! unchecked `mcall!` is involved.
 //!
 //! - [`SecureFile`] — wraps `std::fs` (read/write files)
 //! - [`SecureStream`] — wraps `std::net::TcpStream` (network I/O)
@@ -22,19 +30,21 @@ pub struct SecureFile<L: Label> {
 }
 
 impl<L: Label> SecureFile<L> {
-    /// Create a labeled file handle. Returns `Labeled<Self, L>`.
-    pub fn open(path: PathBuf) -> Labeled<Self, L> {
-        Labeled::new(SecureFile { path, _label: PhantomData })
+    /// Create a labeled file handle.
+    pub fn open(path: PathBuf) -> Self {
+        SecureFile { path, _label: PhantomData }
     }
 
-    /// Wraps `std::fs::read_to_string`.
-    pub fn read_to_string(&self) -> std::io::Result<String> {
-        std::fs::read_to_string(&self.path)
+    /// Wraps `std::fs::read_to_string`. The contents of an `L`-labeled file
+    /// are `L`-labeled.
+    pub fn read_to_string(&self) -> std::io::Result<Labeled<String, L>> {
+        std::fs::read_to_string(&self.path).map(Labeled::new)
     }
 
-    /// Wraps `std::fs::read`.
-    pub fn read(&self) -> std::io::Result<Vec<u8>> {
-        std::fs::read(&self.path)
+    /// Wraps `std::fs::read`. The contents of an `L`-labeled file are
+    /// `L`-labeled.
+    pub fn read(&self) -> std::io::Result<Labeled<Vec<u8>, L>> {
+        std::fs::read(&self.path).map(Labeled::new)
     }
 
     /// Wraps `std::fs::write` with `Src: LEQ<L>` (no-write-down).
@@ -61,24 +71,32 @@ pub struct SecureStream<L: Label> {
 }
 
 impl<L: Label> SecureStream<L> {
-    /// Wraps `TcpStream::connect`. Returns `Labeled<Self, L>`.
-    pub fn connect(addr: &str) -> std::io::Result<Labeled<Self, L>> {
+    /// Wraps `TcpStream::connect`.
+    pub fn connect(addr: &str) -> std::io::Result<Self> {
         let stream = std::net::TcpStream::connect(addr)?;
-        Ok(Labeled::new(SecureStream { stream, _label: PhantomData }))
+        Ok(SecureStream { stream, _label: PhantomData })
     }
 
-    /// Wraps `TcpStream::read` via `std::io::Read`. Data inherits label L via mcall.
-    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    /// Reads at most `max` bytes, `L`-labeled.
+    ///
+    /// There is deliberately no `read(&mut self, buf: &mut [u8])`: filling a
+    /// caller-supplied unlabeled buffer would put data from an `L` stream into
+    /// raw memory, and the label would land on the returned count rather than
+    /// on the bytes. Returning the buffer is the only sound shape.
+    pub fn read_bytes(&mut self, max: usize) -> std::io::Result<Labeled<Vec<u8>, L>> {
         use std::io::Read;
-        self.stream.read(buf)
+        let mut buf = vec![0u8; max];
+        let n = self.stream.read(&mut buf)?;
+        buf.truncate(n);
+        Ok(Labeled::new(buf))
     }
 
-    /// Wraps `std::io::read_to_string` on the stream.
-    pub fn read_to_string(&mut self) -> std::io::Result<String> {
+    /// Wraps `std::io::read_to_string` on the stream; the result is `L`-labeled.
+    pub fn read_to_string(&mut self) -> std::io::Result<Labeled<String, L>> {
         use std::io::Read;
         let mut s = String::new();
         self.stream.read_to_string(&mut s)?;
-        Ok(s)
+        Ok(Labeled::new(s))
     }
 
     /// Wraps `TcpStream::write_all` with `Src: LEQ<L>` (no-write-down).
@@ -110,11 +128,11 @@ pub struct SecureCommand<L: Label> {
 
 impl<L: Label> SecureCommand<L> {
     /// Wraps `Command::new`.
-    pub fn new(program: &str) -> Labeled<Self, L> {
-        Labeled::new(SecureCommand {
+    pub fn new(program: &str) -> Self {
+        SecureCommand {
             cmd: std::process::Command::new(program),
             _label: PhantomData,
-        })
+        }
     }
 
     /// Wraps `Command::arg` with `Src: LEQ<L>`.
@@ -129,9 +147,10 @@ impl<L: Label> SecureCommand<L> {
         self
     }
 
-    /// Wraps `Command::output`. Output inherits label L via mcall.
-    pub fn output(&mut self) -> std::io::Result<std::process::Output> {
-        self.cmd.output()
+    /// Wraps `Command::output`. The process was fed `LEQ<L>`-checked
+    /// arguments, so its output is `L`-labeled.
+    pub fn output(&mut self) -> std::io::Result<Labeled<std::process::Output, L>> {
+        self.cmd.output().map(Labeled::new)
     }
 
     /// Wraps `Command::status`.
